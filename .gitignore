@@ -1,0 +1,49 @@
+# Python virtual environment
+venv/
+.env
+.venv/
+.env/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Logs
+*.log
+
+# IDE / Editor settings
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node.js frontend (React dashboard)
+smc-dashboard/node_modules/
+smc-dashboard/build/
+smc-dashboard/.env
+
+# Jupyter / testing
+.ipynb_checkpoints/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.bak
+
+# OneDrive temp files
+~$*
