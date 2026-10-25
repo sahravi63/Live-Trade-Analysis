@@ -1,27 +1,18 @@
 """
-Decision Engine — v3
+Decision Engine — v4
 ====================
-Enhancements over v2:
-  ✦ AMD Phase integration (Accumulation → Manipulation → Distribution)
-  ✦ LH (Lower High) SELL entry on pullback during downtrend
-  ✦ HL (Higher Low) BUY entry on pullback during uptrend
-  ✦ Gold (XAUUSD) pip / lot handling
-  ✦ Manipulation extreme used as precision SL (tighter than swing)
-  ✦ Suppression zone: no BUY above LH, no SELL below HL
-  ✦ Cleaner entry context: AMD zone → FVG → OTE priority
-
-Scenario handled (per your spec):
-  Major trend DOWN → pullback with HH → CHoCH confirms → LLs form
-  → pullback to LH area → FVG / OB / manipulation zone inside
-  → SELL entry, SL above LH wick (manipulation extreme)
-  → TP to next sell-side liquidity pool
-
-Example (Gold):
-  Major trend: Bearish
-  Pullback high (LH / manipulation extreme): 4566
-  Entry zone (FVG inside LH area): 4563
-  TP (sell-side pool / next LL): 4540
-  R:R = (4563-4540)/(4566-4563) = 23/3 ≈ 7.7
+Changes over v3:
+  ✦ MSS gate: DISTRIBUTION setups now require mss_detected=True to get
+    the full +20 score. Without MSS they get +10 (Manipulation-class score).
+    This stops the engine from entering on displacement alone before
+    the structural shift is confirmed.
+  ✦ Divergence confluence bonus: +8 when AMD reports divergence.
+  ✦ setup_type propagation fixed: CHOCH_REVERSAL is no longer overwritten
+    by LH_SELL/HL_BUY if the CHoCH is what generated the signal.
+  ✦ PDZ suppression tightened: SELL in discount zone now returns WAIT
+    immediately (previously only penalised score).
+  ✦ Confidence floor raised from 0.45 → 0.50 to reduce marginal entries.
+  ✦ calc_atr exposed for orchestrator (no change).
 """
 
 from dataclasses import dataclass, field
@@ -52,12 +43,12 @@ class TradeSignal:
     warnings: list[str] = field(default_factory=list)
     confluence_score: int = 0
     amd_phase: str = "UNKNOWN"
-    setup_type: str = ""          # e.g. "LH_SELL", "HL_BUY", "CHOCH_REVERSAL"
+    setup_type: str = ""
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def calculate_atr(candles: list[dict], period: int = 14) -> float:
     trs = []
@@ -74,7 +65,7 @@ def _is_gold(symbol: str) -> bool:
 
 def _pip_size(symbol: str) -> float:
     if _is_gold(symbol):
-        return 0.01       # Gold: 1 pip = $0.01
+        return 0.01
     if "JPY" in symbol.upper():
         return 0.01
     return 0.0001
@@ -91,18 +82,15 @@ def _recent_swing_high(structure: StructureResult, n: int = 3) -> Optional[float
 
 
 def _last_lower_high(structure: StructureResult) -> Optional[float]:
-    """Return the most recent LH swing point (for SELL setup)."""
     for sh in reversed(structure.swing_highs):
         if sh.label and sh.label.value == "LH":
             return sh.price
-    # Fallback: last swing high
     if structure.swing_highs:
         return structure.swing_highs[-1].price
     return None
 
 
 def _last_higher_low(structure: StructureResult) -> Optional[float]:
-    """Return the most recent HL swing point (for BUY setup)."""
     for sl in reversed(structure.swing_lows):
         if sl.label and sl.label.value == "HL":
             return sl.price
@@ -118,21 +106,13 @@ def _sl_for_sell_lh(
     atr: float,
     symbol: str = "EURUSD",
 ) -> float:
-    """
-    SL for a SELL at LH:
-    Priority: AMD manipulation extreme > swing high + buffer
-    """
-    pip = _pip_size(symbol)
-
-    # AMD gives us the exact manipulation wick — use that
     if amd and amd.manipulation and amd.manipulation.direction == "bearish_hunt":
-        return round(amd.manipulation.extreme + atr * 0.2, 5)
-
-    # Fall back to the last swing high
+        cand = round(amd.manipulation.extreme + atr * 0.2, 5)
+        if cand > current_price:          # only valid if it sits above entry
+            return cand
     lh = _last_lower_high(structure)
     if lh and lh > current_price:
         return round(lh + atr * 0.25, 5)
-
     return round(current_price + atr * 1.5, 5)
 
 
@@ -143,17 +123,13 @@ def _sl_for_buy_hl(
     atr: float,
     symbol: str = "EURUSD",
 ) -> float:
-    """
-    SL for a BUY at HL:
-    Priority: AMD manipulation extreme > swing low - buffer
-    """
     if amd and amd.manipulation and amd.manipulation.direction == "bullish_hunt":
-        return round(amd.manipulation.extreme - atr * 0.2, 5)
-
+        cand = round(amd.manipulation.extreme - atr * 0.2, 5)
+        if cand < current_price:          # only valid if it sits below entry
+            return cand
     hl = _last_higher_low(structure)
     if hl and hl < current_price:
         return round(hl - atr * 0.25, 5)
-
     return round(current_price - atr * 1.5, 5)
 
 
@@ -186,7 +162,6 @@ def _tp_for_sell(current_price, sl, liquidity: LiquidityResult, min_rr: float) -
 
 
 def _price_near_lh(current_price: float, lh_price: Optional[float], atr: float) -> bool:
-    """Is price pulling back into the LH zone (within 1.5×ATR)?"""
     if lh_price is None:
         return False
     return abs(current_price - lh_price) <= atr * 1.5
@@ -198,9 +173,9 @@ def _price_near_hl(current_price: float, hl_price: Optional[float], atr: float) 
     return abs(current_price - hl_price) <= atr * 1.5
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Main Decision Function
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 def decide(
     candles: list[dict],
@@ -211,30 +186,26 @@ def decide(
     current_price: float,
     amd: Optional[AMDResult] = None,
     min_rr: float = 1.8,
-    min_confidence: float = 0.45,
+    min_confidence: float = 0.50,   # raised from 0.45
     symbol: str = "EURUSD",
 ) -> TradeSignal:
     """
-    Scoring system (max = 100+):
+    Scoring system (max ≈ 120):
 
-    Hard-gate conditions (any failure → WAIT):
+    Hard-gate conditions (any failure → WAIT immediately):
       ✗ No clear structure
-      ✗ Displacement direction ≠ trend direction (unless CHoCH reversal)
-      ✗ No FVG or OB near price
-      ✗ BUY in premium zone / SELL in discount zone
-      ✗ BUY above LH / SELL below HL (trap zones)
+      ✗ Trend ≠ displacement direction (unless CHoCH reversal)
+      ✗ No active FVG near price
+      ✗ SELL in discount zone / BUY in premium zone (PDZ suppression — hard gate)
+      ✗ Confidence < min_confidence after scoring
+      ✗ R:R < min_rr
 
-    Setup types detected:
-      LH_SELL      — pullback to Lower High in downtrend → short with AMD SL
-      HL_BUY       — pullback to Higher Low in uptrend → long with AMD SL
-      CHOCH_REVERSAL — CHoCH forming, entering the new direction early
-      BOS_CONTINUATION — clean BOS with FVG retracement
-
-    AMD Integration:
-      +20  AMD Distribution phase (manipulation confirmed, price expanding)
-      +15  AMD Manipulation phase (sweep confirmed, entry setup forming)
+    AMD scoring (v4 changes):
+      +20  DISTRIBUTION phase + mss_detected        (full confirmation)
+      +12  DISTRIBUTION phase, no MSS yet            (displacement only — reduced)
+      +15  MANIPULATION phase + matching bias        (stop hunt live)
       +10  Price inside AMD entry zone
-      +10  Manipulation SL is tighter than swing SL (better R:R)
+      +8   Divergence detected (new)
     """
     score    = 0
     reasons  = []
@@ -244,7 +215,7 @@ def decide(
     atr      = calculate_atr(candles)
     amd_phase_str = amd.phase.value if amd else "UNKNOWN"
 
-    # ── STEP 1: Determine directional bias ────────────────────────────────────
+    # ── STEP 1: Directional bias ──────────────────────────────────────────────
     dir_bull = (
         structure.trend == Trend.BULLISH
         and displacement.last_displacement_dir == "bullish"
@@ -266,10 +237,21 @@ def decide(
 
     if dir_bull or choch_bull:
         bias = Signal.BUY
-        setup_type = "CHOCH_REVERSAL" if choch_bull else "BOS_CONTINUATION"
+        # CHoCH gets a head-start: entering the new trend early has alpha
+        if choch_bull:
+            setup_type = "CHOCH_REVERSAL"
+            score += 5
+            reasons.append("CHoCH bullish reversal — entering new trend early")
+        else:
+            setup_type = "BOS_CONTINUATION"
     elif dir_bear or choch_bear:
         bias = Signal.SELL
-        setup_type = "CHOCH_REVERSAL" if choch_bear else "BOS_CONTINUATION"
+        if choch_bear:
+            setup_type = "CHOCH_REVERSAL"
+            score += 5
+            reasons.append("CHoCH bearish reversal — entering new trend early")
+        else:
+            setup_type = "BOS_CONTINUATION"
     else:
         warnings.append(
             f"Trend ({structure.trend.value}) ≠ displacement "
@@ -277,25 +259,49 @@ def decide(
         )
         return _wait_signal(current_price, atr, reasons, warnings, amd_phase_str)
 
-    # ── STEP 2: AMD Phase check ───────────────────────────────────────────────
+    # ── STEP 2: Hard PDZ gate (SELL in discount / BUY in premium) ────────────
+    eq = structure.equilibrium
+    if eq:
+        if bias == Signal.BUY and structure.premium_zone and current_price >= structure.premium_zone:
+            warnings.append("BUY attempted in premium zone — hard suppression active")
+            return _wait_signal(current_price, atr, reasons, warnings, amd_phase_str)
+        if bias == Signal.SELL and structure.discount_zone and current_price <= structure.discount_zone:
+            warnings.append("SELL attempted in discount zone — hard suppression active")
+            return _wait_signal(current_price, atr, reasons, warnings, amd_phase_str)
+
+        # Soft PDZ bonus (favourable placement within the range)
+        if bias == Signal.BUY and current_price < eq:
+            score += 10
+            reasons.append("Price in discount zone (below EQ) — favorable BUY")
+        elif bias == Signal.SELL and current_price > eq:
+            score += 10
+            reasons.append("Price in premium zone (above EQ) — favorable SELL")
+
+    # ── STEP 3: AMD Phase check ───────────────────────────────────────────────
     if amd:
         if amd.phase == AMDPhase.DISTRIBUTION:
-            # Best: we're in distribution, price is moving in expected direction
-            # Look for pullback entry
             amd_bias_matches = (
                 (amd.bias == "bearish" and bias == Signal.SELL) or
                 (amd.bias == "bullish" and bias == Signal.BUY)
             )
             if amd_bias_matches:
-                score += 20
-                reasons.append(
-                    f"AMD Distribution phase confirmed ({amd.bias.upper()} bias)"
-                )
-                # Refine setup type
-                if bias == Signal.SELL:
-                    setup_type = "LH_SELL"
+                # MSS required for full score — without it price may still reverse
+                if amd.mss_detected:
+                    score += 20
+                    reasons.append(
+                        f"AMD Distribution + MSS confirmed ({amd.bias.upper()} bias)"
+                    )
                 else:
-                    setup_type = "HL_BUY"
+                    score += 12
+                    reasons.append(
+                        f"AMD Distribution phase ({amd.bias.upper()}) — awaiting MSS"
+                    )
+                    warnings.append(
+                        "MSS not yet confirmed — distribution may reverse; wait for LH/HL"
+                    )
+                # Preserve CHoCH setup_type; only overwrite BOS_CONTINUATION
+                if setup_type == "BOS_CONTINUATION":
+                    setup_type = "LH_SELL" if bias == Signal.SELL else "HL_BUY"
             else:
                 warnings.append(
                     f"AMD bias ({amd.bias}) conflicts with signal ({bias.value})"
@@ -313,16 +319,21 @@ def decide(
                     f"AMD Manipulation phase — stop hunt confirmed, "
                     f"distribution imminent ({amd.bias.upper()})"
                 )
-                setup_type = "LH_SELL" if bias == Signal.SELL else "HL_BUY"
+                if setup_type == "BOS_CONTINUATION":
+                    setup_type = "LH_SELL" if bias == Signal.SELL else "HL_BUY"
             else:
                 score -= 5
 
         elif amd.phase == AMDPhase.ACCUMULATION:
-            # Still in range — caution
             warnings.append("AMD: still in Accumulation range — no manipulation yet")
             score -= 5
 
-        # Price inside AMD entry zone = extra confluence
+        # Divergence bonus (new in v4)
+        if amd.divergence_detected:
+            score += 8
+            reasons.append("Momentum divergence detected — trapped money signal")
+
+        # AMD entry zone confluence
         if (amd.entry_zone_low and amd.entry_zone_high
                 and amd.entry_zone_low <= current_price <= amd.entry_zone_high):
             score += 10
@@ -331,7 +342,7 @@ def decide(
                 f"({amd.entry_zone_low:.5f} – {amd.entry_zone_high:.5f})"
             )
 
-    # ── STEP 3: LH / HL Proximity check ──────────────────────────────────────
+    # ── STEP 4: LH / HL Proximity check ──────────────────────────────────────
     lh_price = _last_lower_high(structure)
     hl_price = _last_higher_low(structure)
 
@@ -342,7 +353,8 @@ def decide(
                 f"Price at/near Lower High ({lh_price:.5f}) — "
                 "ideal SELL zone in downtrend pullback"
             )
-            setup_type = "LH_SELL"
+            if setup_type == "BOS_CONTINUATION":
+                setup_type = "LH_SELL"
         elif lh_price and current_price > lh_price:
             warnings.append(
                 f"Price {current_price:.5f} above LH {lh_price:.5f} — "
@@ -357,29 +369,14 @@ def decide(
                 f"Price at/near Higher Low ({hl_price:.5f}) — "
                 "ideal BUY zone in uptrend pullback"
             )
-            setup_type = "HL_BUY"
+            if setup_type == "BOS_CONTINUATION":
+                setup_type = "HL_BUY"
         elif hl_price and current_price < hl_price:
             warnings.append(
                 f"Price {current_price:.5f} below HL {hl_price:.5f} — "
                 "potential trap, SELL bias at this level"
             )
             score -= 15
-
-    # ── STEP 4: Premium / Discount zone filter ────────────────────────────────
-    eq = structure.equilibrium
-    if eq:
-        if bias == Signal.BUY and current_price < eq:
-            score += 10
-            reasons.append("Price in discount zone (below EQ) — favorable BUY")
-        elif bias == Signal.BUY and structure.premium_zone and current_price >= structure.premium_zone:
-            warnings.append("BUY attempted in premium zone — lower probability")
-            score -= 10
-        elif bias == Signal.SELL and current_price > eq:
-            score += 10
-            reasons.append("Price in premium zone (above EQ) — favorable SELL")
-        elif bias == Signal.SELL and structure.discount_zone and current_price <= structure.discount_zone:
-            warnings.append("SELL attempted in discount zone — lower probability")
-            score -= 10
 
     # ── STEP 5: Structure event ───────────────────────────────────────────────
     if structure.last_event == StructureEvent.BOS:
@@ -469,7 +466,6 @@ def decide(
     confidence = round(min(max(score / 100, 0.0), 1.0), 3)
 
     # ── Build trade levels ────────────────────────────────────────────────────
-    # Priority: AMD zone > FVG > OTE > ATR fallback
     if (amd and amd.entry_zone_low and amd.entry_zone_high
             and amd.phase in (AMDPhase.MANIPULATION, AMDPhase.DISTRIBUTION)):
         entry_low  = amd.entry_zone_low
@@ -491,8 +487,18 @@ def decide(
     reward = abs(tp - entry_mid)
     rr     = round(reward / risk, 2) if risk > 0 else 0.0
 
+    # ── Gate: levels must be on the correct side of the entry zone ───────────
+    if bias == Signal.BUY:
+        levels_ok = sl < entry_low and tp > entry_high
+    else:
+        levels_ok = sl > entry_high and tp < entry_low
+
     # ── Gate: suppress if confidence or RR insufficient ──────────────────────
-    if confidence < min_confidence:
+    if not levels_ok:
+        warnings.append(f"Invalid levels (SL {sl:.5f} / TP {tp:.5f} vs entry "
+                        f"{entry_low:.5f}-{entry_high:.5f}) — WAIT")
+        bias = Signal.WAIT
+    elif confidence < min_confidence:
         warnings.append(f"Confidence {confidence:.0%} below threshold {min_confidence:.0%} — WAIT")
         bias = Signal.WAIT
     elif rr < min_rr:

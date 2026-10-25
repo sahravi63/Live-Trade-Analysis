@@ -1,0 +1,50 @@
+{
+  "_comment": "Market Analysis Bot settings. Edit and restart the bot. Paper trading by default.",
+  "watchlist": ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"],
+  "timeframes": ["M5", "M15"],
+  "scan_interval_seconds": 60,
+  "candles": 300,
+  "data_source": "auto",
+  "use_closed_bars_only": true,
+
+  "spread": {
+    "assumed_pips": {"default": 1.0, "EURUSD": 0.8, "GBPUSD": 1.2, "USDJPY": 1.0, "XAUUSD": 25},
+    "max_pips": {"default": 1.5, "XAUUSD": 40}
+  },
+
+  "account": {
+    "balance": 10000,
+    "risk_pct": 0.005,
+    "max_daily_loss_pct": 0.02,
+    "max_open_trades": 2,
+    "max_consecutive_losses": 3,
+    "cooldown_seconds": 60
+  },
+
+  "filters": {
+    "min_atr_pct": 0.00025,
+    "max_atr_pct": 0.003,
+    "min_liquidity_score": 0.55,
+    "min_rr": 1.8,
+    "min_confidence": 0.45
+  },
+
+  "timemachine": {
+    "enabled": true,
+    "sims": 5000,
+    "horizon_bars": 48,
+    "history_replay": true,
+    "min_expected_r": 0.0,
+    "min_history_samples": 5
+  },
+
+  "news": {"enabled": true, "window_minutes": 30, "impacts": ["High"]},
+
+  "execution": {
+    "mode": "paper",
+    "max_hold_bars": 48,
+    "reentry_block_minutes": 120
+  },
+
+  "alerts": {"sound": true, "telegram": true, "alert_on_blocked_setups": false}
+}

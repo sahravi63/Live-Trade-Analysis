@@ -142,10 +142,18 @@ def _score_fvg(candles: list[dict], idx: int, direction: str, atr: float) -> flo
 
 
 def _update_fill_status(fvgs: list[FairValueGap], candles: list[dict]) -> None:
-    """Mark FVGs as filled when price has traded through them fully, mitigated at 50%."""
+    """Mark FVGs as filled when price has traded through them fully, mitigated at 50%.
+
+    fvg.index is the middle candle (i-1) of the three-candle pattern detected at
+    loop index i.  The FVG gap sits between candles[i-2] and candles[i], so the
+    earliest candle that can fill it is candles[i+1] = candles[fvg.index + 2].
+    Using fvg.index + 1 would include candles[i] itself, which is the third candle
+    that *defines* one boundary of the gap — an off-by-one.
+    """
     for fvg in fvgs:
         mid = (fvg.top + fvg.bottom) / 2.0
-        for c in candles[fvg.index + 1:]:
+        # Start checking from the candle AFTER the three-candle formation
+        for c in candles[fvg.index + 2:]:
             if fvg.direction == "bullish":
                 if c["low"] <= fvg.bottom:
                     fvg.filled = True

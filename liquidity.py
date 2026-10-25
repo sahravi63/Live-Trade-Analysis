@@ -50,6 +50,7 @@ def detect_equal_levels(
         if used[i]:
             continue
         cluster = [highs[i]]
+        used[i] = True          # mark anchor so it can't seed a second cluster
         for j in range(i + 1, len(highs)):
             if abs(highs[j] - highs[i]) <= tolerance_pips:
                 cluster.append(highs[j])
@@ -68,6 +69,7 @@ def detect_equal_levels(
         if used[i]:
             continue
         cluster = [lows[i]]
+        used[i] = True          # mark anchor
         for j in range(i + 1, len(lows)):
             if abs(lows[j] - lows[i]) <= tolerance_pips:
                 cluster.append(lows[j])

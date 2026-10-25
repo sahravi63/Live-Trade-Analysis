@@ -219,20 +219,22 @@ def label_structure(
 
 def _find_order_block(candles: list[dict], from_index: int, direction: str) -> Optional[OrderBlock]:
     """Find the last opposite-colour candle before the BOS impulse."""
-    search = candles[max(0, from_index - 10): from_index + 1]
-    for c in reversed(search):
+    start = max(0, from_index - 10)
+    # Use enumerate on the full slice so we have the real absolute index,
+    # avoiding candles.index(c) which returns the FIRST match and breaks on
+    # duplicate OHLCV candles (common in flat markets / mock data).
+    for abs_idx in range(from_index, start - 1, -1):
+        c = candles[abs_idx]
         if direction == "bullish" and c["close"] < c["open"]:   # last red candle
-            idx = candles.index(c)
             return OrderBlock(
-                index=idx,
+                index=abs_idx,
                 top=c["high"],
                 bottom=c["low"],
                 direction="bullish",
             )
         if direction == "bearish" and c["close"] > c["open"]:   # last green candle
-            idx = candles.index(c)
             return OrderBlock(
-                index=idx,
+                index=abs_idx,
                 top=c["high"],
                 bottom=c["low"],
                 direction="bearish",

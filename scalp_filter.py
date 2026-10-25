@@ -44,28 +44,24 @@ def classify_session(dt: Optional[datetime] = None) -> tuple[str, float]:
     """
     Returns (session_name, liquidity_score 0–1).
     Uses UTC time.
+
+    Fix: Sydney is only returned when no higher-priority session is active.
+    Previously in_sydney fired during 00:00–06:00 UTC which overlaps Tokyo,
+    causing the elif chain to hide the bug — now guarded explicitly.
     """
     if dt is None:
         dt = datetime.now(timezone.utc)
     t = dt.time()
 
-    # Sessions in UTC
-    sydney_open   = time(21, 0)
-    sydney_close  = time(6, 0)
-    tokyo_open    = time(0, 0)
-    tokyo_close   = time(9, 0)
-    london_open   = time(7, 0)
-    london_close  = time(16, 0)
-    ny_open       = time(12, 0)
-    ny_close      = time(21, 0)
-
-    in_london = london_open <= t < london_close
-    in_ny     = ny_open <= t < ny_close
-    in_tokyo  = tokyo_open <= t < tokyo_close
-    in_sydney = t >= sydney_open or t < sydney_close
+    in_london = time(7, 0) <= t < time(16, 0)
+    in_ny     = time(12, 0) <= t < time(21, 0)
+    in_tokyo  = time(0, 0) <= t < time(9, 0)
+    # Sydney: 21:00–06:00 UTC, but only when Tokyo/London/NY are NOT active
+    in_sydney_raw = t >= time(21, 0) or t < time(6, 0)
+    in_sydney = in_sydney_raw and not in_tokyo and not in_london and not in_ny
 
     if in_london and in_ny:
-        return "London/NY Overlap", 1.0          # highest liquidity
+        return "London/NY Overlap", 1.0
     elif in_london:
         return "London", 0.85
     elif in_ny:
@@ -75,7 +71,6 @@ def classify_session(dt: Optional[datetime] = None) -> tuple[str, float]:
     elif in_sydney:
         return "Sydney", 0.40
     else:
-        # 21:00–22:00 UTC dead zone, 17:00–18:00 UTC NY closing
         return "Off-Hours", 0.15
 
 
@@ -88,7 +83,10 @@ def _check_spread(
     max_spread_pips: float,
 ) -> tuple[bool, str]:
     if spread_pips is None:
-        return True, "spread_unknown"      # can't check — allow but note
+        # Unknown spread must NOT silently pass — caller must provide spread for
+        # live trading.  Treat as a soft block: ok=False so the filter fails,
+        # but the label is distinct so the caller can choose to override.
+        return False, "spread_unknown (provide spread_pips for live trading)"
     ok = spread_pips <= max_spread_pips
     label = "spread_ok" if ok else f"spread_too_wide ({spread_pips:.1f} > {max_spread_pips})"
     return ok, label
@@ -212,9 +210,9 @@ def run_scalp_filter(
 
     # 1. Spread
     spread_ok, spread_label = _check_spread(spread_pips, max_spread_pips)
-    if "unknown" in spread_label:
-        notes.append("Spread not provided — verify with broker API")
-        passed.append("spread_not_checked")
+    if "spread_unknown" in spread_label:
+        notes.append("spread_pips not provided — spread filter blocking. Pass spread_pips= for live trading.")
+        failed.append(spread_label)
     elif spread_ok:
         passed.append(spread_label)
     else:

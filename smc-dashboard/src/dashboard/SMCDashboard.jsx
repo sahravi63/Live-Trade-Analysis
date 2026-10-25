@@ -1,18 +1,18 @@
 /**
- * SMC Trading Dashboard — v3.1
+ * SMC Trading Dashboard — v4.0
  *
- * Fixes vs v3:
- *   1. Scalp layer (scalp_filter, sizing, ready_to_trade, block_reasons,
- *      exec_entry/sl/tp, scalp_summary) now fully wired — new "Execution" tab
- *   2. Risk status panel (daily P&L, halt, cooldown) polling /risk/status every 10s
- *   3. PDZ gate indicator fixed — matches actual warning strings from backend
- *   4. spread_pips input added to controls — passed to /analyze
- *   5. SL/TP lines on chart guarded: only drawn when signal ≠ WAIT and value > 0
- *   6. candle count selector (100 / 200 / 300 / 500)
- *   7. Exec levels card shows spread-adjusted entry, SL, TP with pip labels
- *   8. Session badge coloured by liquidity score from scalp_filter
- *   9. Momentum score shown as mini progress bar in execution tab
- *  10. All 6 filter check results shown with pass/fail colour coding
+ * Changes over v3.1 (AMD v2 integration):
+ *   1.  oscillator_data now sourced from API (real close-delta, not client-side proxy)
+ *   2.  MSS level drawn on chart as a purple horizontal line
+ *   3.  Divergence candle markers drawn on chart at divergence_indices positions
+ *   4.  AMDPhaseCard shows MSS level price + divergence badge with index range
+ *   5.  PDZ hard-gate now also catches "hard suppression" warning text from v4 engine
+ *   6.  Version badge updated to v4.0
+ *   7.  "Confluence" tab now groups AMD reasons separately with an AMD sub-header
+ *   8.  computeRRTargets ratios updated to [1.5, 2.0, 3.0] to match min_rr=1.8
+ *   9.  buildOscillatorData replaced: uses API data when available (preferred),
+ *       falls back to client-side close-delta for mock mode
+ *  10.  Chart MSS marker now uses mss_level (if set) instead of manip close
  */
 
 import { useEffect, useRef, useState, useCallback } from "react";
@@ -21,6 +21,7 @@ import {
   createChart,
   createSeriesMarkers,
   CrosshairMode,
+  HistogramSeries,
   LineSeries,
   LineStyle,
 } from "lightweight-charts";
@@ -78,6 +79,27 @@ const SETUP_COLORS = {
   HL_BUY:           C.green,
   CHOCH_REVERSAL:   C.purple,
   BOS_CONTINUATION: C.blue,
+};
+
+const AMD_BOX = {
+  accumulation: {
+    fill: "rgba(245,166,35,0.13)",
+    stroke: "rgba(245,166,35,0.55)",
+    label: "ACCUMULATION",
+    labelColor: C.amber,
+  },
+  manipulation: {
+    fill: "rgba(240,71,106,0.12)",
+    stroke: "rgba(240,71,106,0.50)",
+    label: "MANIPULATION",
+    labelColor: C.red,
+  },
+  distribution: {
+    fill: "rgba(32,214,138,0.12)",
+    stroke: "rgba(32,214,138,0.50)",
+    label: "DISTRIBUTION",
+    labelColor: C.green,
+  },
 };
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -207,6 +229,9 @@ function AMDPhaseCard({ amd, symbol }) {
           {cfg.label}
         </div>
         {amd.bias && <Badge label={amd.bias.toUpperCase()} color={biasColor} small />}
+        {amd.distribution_started && <Badge label="DIST LIVE" color="green" small />}
+        {amd.mss_detected && <Badge label="MSS" color="purple" small />}
+        {amd.divergence_detected && <Badge label="DIVERGENCE" color="red" small />}
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -223,7 +248,7 @@ function AMDPhaseCard({ amd, symbol }) {
         />
         <Stat
           label="Manip Type"
-          value={amd.manipulation?.direction?.replace(/_/g, " ").toUpperCase() || "â€”"}
+          value={amd.manipulation?.direction?.replace(/_/g, " ").toUpperCase() || "—"}
           color={C.amber}
           mono={false}
         />
@@ -239,9 +264,26 @@ function AMDPhaseCard({ amd, symbol }) {
         />
         <Stat
           label="Entry Zone"
-          value={amd.entry_zone_low && amd.entry_zone_high ? `${fmtPrice(amd.entry_zone_low, symbol)} - ${fmtPrice(amd.entry_zone_high, symbol)}` : "â€”"}
+          value={amd.entry_zone_low && amd.entry_zone_high ? `${fmtPrice(amd.entry_zone_low, symbol)} – ${fmtPrice(amd.entry_zone_high, symbol)}` : "—"}
           color={C.blue}
         />
+        {amd.mss_detected && (
+          <Stat
+            label="MSS Level"
+            value={fmtPrice(amd.mss_level, symbol)}
+            color="#d070ff"
+            sub="Structural shift confirmed"
+          />
+        )}
+        {amd.divergence_detected && amd.divergence_indices?.length >= 2 && (
+          <Stat
+            label="Div Range"
+            value={`Bar ${amd.divergence_indices[0]} → ${amd.divergence_indices[1]}`}
+            color={C.red}
+            sub="Trapped momentum pivot"
+            mono={false}
+          />
+        )}
       </div>
 
       {amd.distribution_started && (
@@ -249,6 +291,27 @@ function AMDPhaseCard({ amd, symbol }) {
           Distribution leg started. Wait for pullback to the AMD entry zone.
         </div>
       )}
+      {(() => {
+        const rrTargets = amd.rr_targets || computeRRTargets(amd.entry_zone_high, amd.manipulation_sl);
+        if (!rrTargets) return null;
+        return (
+          <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
+            {Object.entries(rrTargets).map(([label, price]) => (
+              <div key={label} style={{
+                background: C.greenDim,
+                border: `1px solid ${C.green}40`,
+                borderRadius: 6,
+                padding: "3px 8px",
+                fontSize: 10,
+                fontFamily: "monospace",
+              }}>
+                <span style={{ color: C.muted }}>{label} {"->"} </span>
+                <span style={{ color: C.green, fontWeight: 700 }}>{fmtPrice(price, symbol)}</span>
+              </div>
+            ))}
+          </div>
+        );
+      })()}
       {!!amd.notes?.length && (
         <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 3 }}>
           {amd.notes.slice(0, 4).map((note, i) => (
@@ -314,6 +377,300 @@ function addBand(chart, t0, t1, top, bot, color, lStyle, title, refs) {
   mkLine(bot, "");
 }
 
+function computeRRTargets(entry, sl, ratios = [1.5, 2.0, 3.0]) {
+  if (!entry || !sl) return null;
+  const risk = Math.abs(entry - sl);
+  const isBearish = entry < sl;
+  return ratios.reduce((targets, ratio) => {
+    targets[`${ratio}RR`] = isBearish ? entry - risk * ratio : entry + risk * ratio;
+    return targets;
+  }, {});
+}
+
+function buildOscillatorData(ohlcData, rawOsc) {
+  // Prefer API-provided oscillator data (real close-delta from amd_phases v2)
+  if (rawOsc?.length) {
+    return rawOsc.map((d) => ({
+      time: Math.floor(new Date(d.time).getTime() / 1000),
+      value: d.value,
+    }));
+  }
+  // Fallback: client-side 14-bar close delta (mock mode)
+  return ohlcData.map((c, i) => {
+    if (i < 14) return { time: c.time, value: 0 };
+    return { time: c.time, value: c.close - ohlcData[i - 14].close };
+  });
+}
+
+function drawAMDBoxes(canvas, chart, candleSeries, amd, ohlcData) {
+  if (!canvas || !chart || !candleSeries || !amd || !ohlcData?.length) return;
+
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const priceToY = (price) => {
+    const coord = candleSeries.priceToCoordinate(price);
+    return coord != null ? coord : null;
+  };
+  const timeToX = (unixSec) => {
+    const coord = chart.timeScale().timeToCoordinate(unixSec);
+    return coord != null ? coord : null;
+  };
+
+  const drawBox = (tStart, tEnd, pHigh, pLow, cfg, extraLabel = null) => {
+    const x1 = timeToX(tStart);
+    const x2 = timeToX(tEnd);
+    const y1 = priceToY(pHigh);
+    const y2 = priceToY(pLow);
+    if (x1 == null || x2 == null || y1 == null || y2 == null) return {};
+
+    const left = Math.min(x1, x2);
+    const right = Math.max(x1, x2);
+    const top = Math.min(y1, y2);
+    const bottom = Math.max(y1, y2);
+    const boxW = right - left;
+    const boxH = bottom - top;
+    if (boxW < 2 || boxH < 2) return { left, right, top, bottom };
+
+    ctx.fillStyle = cfg.fill;
+    ctx.fillRect(left, top, boxW, boxH);
+    ctx.strokeStyle = cfg.stroke;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(left + 0.5, top + 0.5, boxW - 1, boxH - 1);
+    ctx.setLineDash([]);
+
+    ctx.font = "bold 11px 'JetBrains Mono', monospace";
+    ctx.fillStyle = cfg.labelColor;
+    ctx.fillText(cfg.label, left + 6, top + 15);
+
+    if (extraLabel) {
+      ctx.font = "bold 10px 'JetBrains Mono', monospace";
+      ctx.fillText(extraLabel, left + 6, top + 28);
+    }
+
+    return { left, right, top, bottom };
+  };
+
+  const acc = amd.accumulation_range;
+  const manip = amd.manipulation;
+
+  if (acc && ohlcData[acc.start_index] && ohlcData[acc.end_index]) {
+    drawBox(ohlcData[acc.start_index].time, ohlcData[acc.end_index].time, acc.high, acc.low, AMD_BOX.accumulation);
+  }
+
+  if (acc && manip && ohlcData[acc.end_index] && ohlcData[manip.candle_index]) {
+    const isBearhunt = manip.direction === "bearish_hunt";
+    const boxHigh = isBearhunt ? manip.extreme : acc.high;
+    const boxLow = isBearhunt ? acc.low : manip.extreme;
+    const bounds = drawBox(
+      ohlcData[acc.end_index].time,
+      ohlcData[manip.candle_index].time,
+      boxHigh,
+      boxLow,
+      AMD_BOX.manipulation,
+    );
+    const mssY = priceToY(manip.close || (boxHigh + boxLow) / 2);
+    if (bounds.right != null && mssY != null) {
+      ctx.font = "bold 10px 'JetBrains Mono', monospace";
+      ctx.fillStyle = "#d070ff";
+      ctx.strokeStyle = C.purpleDim;
+      ctx.lineWidth = 3;
+      ctx.strokeText("MSS", bounds.right - 28, mssY - 6);
+      ctx.fillText("MSS", bounds.right - 28, mssY - 6);
+      ctx.beginPath();
+      ctx.moveTo(bounds.right, mssY - 10);
+      ctx.lineTo(bounds.right, mssY + 10);
+      ctx.strokeStyle = "#d070ff";
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([2, 2]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  if (manip && amd.distribution_started && ohlcData[manip.candle_index]) {
+    const lastCandle = ohlcData[ohlcData.length - 1];
+    const isBearhunt = manip.direction === "bearish_hunt";
+    const distHigh = isBearhunt
+      ? (amd.entry_zone_high || acc?.high || manip.close)
+      : (amd.entry_zone_high || manip.extreme * 1.02);
+    const distLow = isBearhunt
+      ? (amd.entry_zone_low || manip.extreme * 0.98)
+      : (amd.entry_zone_low || acc?.low || manip.close);
+
+    if (distHigh && distLow) {
+      const distBounds = drawBox(
+        ohlcData[manip.candle_index].time,
+        lastCandle.time,
+        distHigh,
+        distLow,
+        AMD_BOX.distribution,
+      );
+      const entry = amd.entry_zone_high || distHigh;
+
+      if (entry && distBounds.right != null) {
+        const entryY = priceToY(entry);
+        if (entryY != null) {
+          const txt = `${isBearhunt ? "SHORT" : "LONG"} ${fmt(entry)}`;
+          ctx.font = "bold 11px 'JetBrains Mono', monospace";
+          const tw = ctx.measureText(txt).width;
+          ctx.fillStyle = isBearhunt ? "rgba(240,71,106,0.85)" : "rgba(32,214,138,0.85)";
+          ctx.beginPath();
+          if (ctx.roundRect) ctx.roundRect(distBounds.right + 4, entryY - 10, tw + 12, 18, 4);
+          else ctx.rect(distBounds.right + 4, entryY - 10, tw + 12, 18);
+          ctx.fill();
+          ctx.fillStyle = "#ffffff";
+          ctx.fillText(txt, distBounds.right + 10, entryY + 3);
+        }
+      }
+    }
+  }
+
+  if (amd.divergence_detected && amd.divergence_indices?.length >= 2) {
+    const [i1, i2] = amd.divergence_indices;
+    if (ohlcData[i1] && ohlcData[i2]) {
+      const x1 = timeToX(ohlcData[i1].time);
+      const x2 = timeToX(ohlcData[i2].time);
+      const y1 = priceToY(ohlcData[i1].high + (ohlcData[i1].high - ohlcData[i1].low) * 0.3);
+      const y2 = priceToY(ohlcData[i2].high + (ohlcData[i2].high - ohlcData[i2].low) * 0.3);
+      if (x1 != null && x2 != null && y1 != null && y2 != null) {
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(x2, y2);
+        ctx.strokeStyle = C.red;
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([4, 3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.font = "bold 10px 'JetBrains Mono', monospace";
+        ctx.fillStyle = C.red;
+        ctx.fillText("DIVERGENCE", (x1 + x2) / 2 - 30, (y1 + y2) / 2 - 10);
+      }
+    }
+  }
+}
+
+// ── Higher-timeframe levels + session breaks ──────────────────────────────────
+const TF_SEC     = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400, W1: 604800 };
+const LEVEL_TFS  = ["M15", "M30", "H1", "H4", "D1", "W1"];
+const LEVEL_COLORS = { M15: C.teal, M30: C.blue, H1: C.purple, H4: C.orange, D1: C.amber, W1: C.red };
+const levelLabel = (tf, hl, current) => {
+  if (tf === "D1") return current ? `Today ${hl}` : `PD${hl}`;
+  if (tf === "W1") return current ? `Week ${hl}`  : `PW${hl}`;
+  return current ? `${tf} ${hl}` : `Prev ${tf} ${hl}`;
+};
+
+const SESSIONS = [
+  { name: "TOKYO",    tz: "Asia/Tokyo",       hour: 9, color: C.amber },
+  { name: "LONDON",   tz: "Europe/London",    hour: 8, color: C.blue },
+  { name: "NEW YORK", tz: "America/New_York", hour: 8, color: C.teal },
+];
+
+const tzFormatters = {};
+// Seconds the given time zone is ahead of UTC at instant `ms`.
+function tzOffsetSec(tz, ms) {
+  const f = tzFormatters[tz] ||= new Intl.DateTimeFormat("en-US", {
+    timeZone: tz, hourCycle: "h23",
+    year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric",
+  });
+  const p = Object.fromEntries(f.formatToParts(new Date(ms)).map(x => [x.type, Number(x.value)]));
+  const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute);
+  return Math.round((asUtc - Math.floor(ms / 60000) * 60000) / 1000);
+}
+// UTC ms of a wall-clock time in `tz`.
+function zonedToUtcMs(tz, y, m, d, h) {
+  const guess = Date.UTC(y, m, d, h);
+  let ms = guess - tzOffsetSec(tz, guess) * 1000;
+  ms = guess - tzOffsetSec(tz, ms) * 1000;    // second pass settles DST edges
+  return ms;
+}
+// MT5 timestamps are broker server time (NY + 7h on most brokers, incl. MetaQuotes-Demo), not UTC.
+const chartOffsetSec = (ms, serverTime) => (serverTime ? tzOffsetSec("America/New_York", ms) + 7 * 3600 : 0);
+
+// Index of the candle whose [time, time + tfSec) contains t, or -1 (weekend / gap / out of range).
+function candleAt(ohlc, t, tfSec) {
+  let lo = 0, hi = ohlc.length - 1, idx = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (ohlc[mid].time <= t) { idx = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return idx >= 0 && t < ohlc[idx].time + tfSec ? idx : -1;
+}
+
+function drawSessionBreaks(canvas, chart, ohlc, { tfSec, serverTime }) {
+  if (!canvas || !chart || !ohlc?.length || !tfSec) return;
+  const ctx = canvas.getContext("2d");
+  const axisH = 28;
+  const firstDay = Math.floor(ohlc[0].time / 86400) - 1;
+  const lastDay  = Math.floor(ohlc[ohlc.length - 1].time / 86400) + 1;
+  const stack = {};
+
+  for (let day = firstDay; day <= lastDay; day++) {
+    const date = new Date(day * 86400000);
+    SESSIONS.forEach((s) => {
+      const realMs = zonedToUtcMs(s.tz, date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), s.hour);
+      const t = realMs / 1000 + chartOffsetSec(realMs, serverTime);
+      const idx = candleAt(ohlc, t, tfSec);
+      if (idx < 0) return;
+      const x = chart.timeScale().timeToCoordinate(ohlc[idx].time);
+      if (x == null || x < 0 || x > canvas.width) return;
+
+      const row = stack[Math.round(x)] = (stack[Math.round(x)] || 0) + 1;
+      ctx.beginPath();
+      ctx.moveTo(Math.round(x) + 0.5, 0);
+      ctx.lineTo(Math.round(x) + 0.5, canvas.height - axisH);
+      ctx.strokeStyle = s.color + "80";
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.font = "bold 9px 'JetBrains Mono', monospace";
+      ctx.fillStyle = s.color;
+      ctx.fillText(s.name, x + 4, 12 * row);
+    });
+  }
+}
+
+function drawOverlay(canvas, chart, candleSeries, amd, ohlcData, sessions) {
+  if (!canvas) return;
+  canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+  drawAMDBoxes(canvas, chart, candleSeries, amd, ohlcData);
+  if (sessions?.enabled) drawSessionBreaks(canvas, chart, ohlcData, sessions);
+}
+
+// Previous completed + current (forming) HTF candle. `bars` are {time (sec), high, low}, oldest first.
+function htfLevels(bars, tf, nowSec) {
+  if (!bars.length) return { prev: null, cur: null };
+  const last = bars[bars.length - 1];
+  const periodEnd = last.time + (tf === "W1" ? 5 * 86400 : TF_SEC[tf]);   // forex week closes Friday
+  return nowSec < periodEnd
+    ? { prev: bars[bars.length - 2] || null, cur: last }
+    : { prev: last, cur: null };
+}
+
+function groupWeekly(daily) {
+  const weeks = [];
+  daily.forEach((b) => {
+    const dow = (new Date(b.time * 1000).getUTCDay() + 6) % 7;      // Monday = 0
+    const start = Math.floor(b.time / 86400) * 86400 - dow * 86400;
+    const w = weeks[weeks.length - 1];
+    if (w && w.time === start) { w.high = Math.max(w.high, b.high); w.low = Math.min(w.low, b.low); }
+    else weeks.push({ time: start, high: b.high, low: b.low });
+  });
+  return weeks;
+}
+
+const loadPref = (key, fallback) => {
+  try { const v = localStorage.getItem(key); return v == null ? fallback : JSON.parse(v); }
+  catch { return fallback; }
+};
+const savePref = (key, value) => {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch {
+    // Storage can be blocked (private mode); the chart works without it.
+  }
+};
+
 // ── Session colour helper ─────────────────────────────────────────────────────
 function sessionColor(session) {
   if (!session) return "gray";
@@ -321,6 +678,161 @@ function sessionColor(session) {
   if (session.includes("London") || session.includes("New York")) return "blue";
   if (session.includes("Tokyo") || session.includes("Sydney")) return "amber";
   return "red"; // Off-Hours
+}
+
+// ── Bot control panel (polls /bot/status, start/stop the scan loop) ────────────
+const fmtTime = (iso) => (iso ? new Date(iso).toLocaleTimeString() : "—");
+
+function BotPanel() {
+  const [bot,     setBot]     = useState(null);
+  const [busy,    setBusy]    = useState(false);
+  const [botErr,  setBotErr]  = useState(null);
+  const [open,    setOpen]    = useState(true);
+
+  const fetchBot = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/bot/status`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setBot(await res.json());
+      setBotErr(null);
+    } catch (e) {
+      setBot(null);
+      setBotErr(`API unreachable (${e.message})`);
+    }
+  }, []);
+
+  useEffect(() => {
+    const first = setTimeout(fetchBot, 0);
+    const t = setInterval(fetchBot, 5_000);
+    return () => { clearTimeout(first); clearInterval(t); };
+  }, [fetchBot]);
+
+  const toggle = async () => {
+    setBusy(true); setBotErr(null);
+    try {
+      const res = await fetch(`${API}/bot/${bot?.running ? "stop" : "start"}`, { method: "POST" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `HTTP ${res.status}`);
+      }
+      await fetchBot();
+    } catch (e) { setBotErr(e.message); }
+    finally     { setBusy(false); }
+  };
+
+  const running = !!bot?.running;
+  const paper   = bot?.paper || {};
+  const rows    = bot?.rows || [];
+  const ready   = rows.filter(r => r.ready);
+  const pending = rows.filter(r => !r.ready && (r.signal === "BUY" || r.signal === "SELL"));
+
+  return (
+    <div style={{ ...cardSt, marginBottom: 14, borderColor: running ? C.greenDim : C.border }}>
+      <div style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{
+            width: 9, height: 9, borderRadius: 99,
+            background: running ? C.green : C.muted,
+            boxShadow: running ? `0 0 8px ${C.green}` : "none",
+          }} />
+          <span style={{ fontSize: 13, fontWeight: 800, color: C.text }}>Market Bot</span>
+          <Badge small label={running ? "RUNNING" : "STOPPED"} color={running ? "green" : "gray"} />
+          {bot && <Badge small label={bot.mode?.toUpperCase()} color={bot.mode === "paper" ? "blue" : "amber"} />}
+          {bot?.running_in === "cli" && <Badge small label="IN TERMINAL" color="purple" />}
+        </div>
+
+        {bot && <>
+          <Stat label="Cycles"    value={bot.cycles} />
+          <Stat label="Last scan" value={fmtTime(bot.last_scan_at)} color={C.muted2} />
+          <Stat label="Next scan" value={running ? fmtTime(bot.next_scan_at) : "—"} color={C.muted2} />
+          <Stat label="Equity"    value={paper.equity != null ? `$${Number(paper.equity).toFixed(2)}` : "—"} />
+          <Stat label="Net P&L"   value={`${(paper.net_pnl || 0) >= 0 ? "+" : ""}$${Number(paper.net_pnl || 0).toFixed(2)}`}
+                color={(paper.net_pnl || 0) >= 0 ? C.green : C.red} />
+          <Stat label="Trades"    value={`${paper.trades || 0} · ${fmtPct((paper.win_rate || 0) * 100)} win`} color={C.muted2} />
+          <Stat label="MT5"       value={bot.mt5_connected ? "connected" : "offline"} color={bot.mt5_connected ? C.green : C.red} mono={false} />
+        </>}
+
+        <div style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+          <button onClick={() => setOpen(o => !o)} style={{
+            ...btnSt, background: "transparent", color: C.muted2, border: `1px solid ${C.border}`,
+          }}>{open ? "Hide details" : "Details"}</button>
+          <button onClick={toggle} disabled={busy || !bot} style={{
+            ...btnSt, border: "none", padding: "7px 18px", fontSize: 12, fontWeight: 700, color: "#fff",
+            background: running ? C.red : C.green,
+            opacity: busy || !bot ? 0.5 : 1,
+          }}>
+            {busy ? "…" : running ? "■ Stop Bot" : "▶ Start Bot"}
+          </button>
+        </div>
+      </div>
+
+      {botErr && <div style={{ marginTop: 10, fontSize: 12, color: C.red }}>✗ {botErr}</div>}
+      {bot?.risk?.halted && <div style={{ marginTop: 10, fontSize: 12, color: C.red, fontWeight: 700 }}>⛔ Trading halted: {bot.risk.halt_reason}</div>}
+
+      {open && bot && (
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 14, marginTop: 14 }}>
+          <div>
+            <SecTitle right={`${bot.open_positions.length} open`}>Open positions</SecTitle>
+            {bot.open_positions.length === 0
+              ? <div style={{ fontSize: 11, color: C.muted }}>No open trades.</div>
+              : bot.open_positions.map(p => (
+                <div key={p.id} style={{ display: "flex", gap: 10, fontSize: 11, fontFamily: "monospace", padding: "4px 0", borderBottom: `1px solid ${C.border}` }}>
+                  <span style={{ color: p.direction === "BUY" ? C.green : C.red, fontWeight: 700, minWidth: 34 }}>{p.direction}</span>
+                  <span style={{ color: C.text, minWidth: 90 }}>{p.symbol} {p.timeframe}</span>
+                  <span style={{ color: C.muted2 }}>@ {fmtPrice(p.entry, p.symbol)}</span>
+                  <span style={{ color: C.red }}>SL {fmtPrice(p.sl, p.symbol)}</span>
+                  <span style={{ color: C.green }}>TP {fmtPrice(p.tp, p.symbol)}</span>
+                  <span style={{ color: C.muted, marginLeft: "auto" }}>{p.lots} lots</span>
+                </div>
+              ))}
+
+            <div style={{ marginTop: 14 }}>
+              <SecTitle right={`${bot.recent_closed.length} shown`}>Recent closed</SecTitle>
+              {bot.recent_closed.length === 0
+                ? <div style={{ fontSize: 11, color: C.muted }}>No closed trades yet.</div>
+                : bot.recent_closed.slice(0, 6).map(p => (
+                  <div key={p.id} style={{ display: "flex", gap: 10, fontSize: 11, fontFamily: "monospace", padding: "4px 0", borderBottom: `1px solid ${C.border}` }}>
+                    <span style={{ color: p.direction === "BUY" ? C.green : C.red, fontWeight: 700, minWidth: 34 }}>{p.direction}</span>
+                    <span style={{ color: C.text, minWidth: 90 }}>{p.symbol} {p.timeframe}</span>
+                    <span style={{ color: C.muted2 }}>{p.exit_reason}</span>
+                    <span style={{ color: p.pnl >= 0 ? C.green : C.red, marginLeft: "auto" }}>
+                      {p.pnl >= 0 ? "+" : ""}{Number(p.pnl).toFixed(2)} ({Number(p.r_multiple).toFixed(2)}R)
+                    </span>
+                  </div>
+                ))}
+            </div>
+          </div>
+
+          <div>
+            <SecTitle right={`${bot.watchlist.length} symbols × ${bot.timeframes.length} TFs · every ${bot.interval_seconds}s`}>Last scan</SecTitle>
+            {rows.length === 0
+              ? <div style={{ fontSize: 11, color: C.muted }}>No scan yet — start the bot.</div>
+              : rows.map(r => (
+                <div key={`${r.symbol}-${r.timeframe}`} style={{ display: "flex", gap: 10, fontSize: 11, padding: "4px 0", borderBottom: `1px solid ${C.border}`, alignItems: "baseline" }}>
+                  <span style={{ fontFamily: "monospace", color: C.text, minWidth: 90 }}>{r.symbol} {r.timeframe}</span>
+                  <span style={{
+                    fontWeight: 700, minWidth: 34,
+                    color: r.signal === "BUY" ? C.green : r.signal === "SELL" ? C.red : C.amber,
+                  }}>{r.signal}</span>
+                  <span style={{ color: r.ready ? C.green : C.muted, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {r.ready ? `READY · ${r.action}` : (r.block_reasons?.[0] || r.error || "—")}
+                  </span>
+                </div>
+              ))}
+            <div style={{ marginTop: 8, fontSize: 10, color: C.muted }}>
+              {ready.length} ready · {pending.length} waiting for entry
+              {bot.upcoming_news?.length > 0 && ` · ${bot.upcoming_news.length} high-impact news in 24h`}
+            </div>
+            {bot.errors?.length > 0 && (
+              <div style={{ marginTop: 8, fontSize: 11, color: C.red }}>
+                {bot.errors.slice(0, 3).map((e, i) => <div key={i}>✗ {typeof e === "string" ? e : JSON.stringify(e)}</div>)}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── Main Component ─────────────────────────────────────────────────────────────
@@ -337,14 +849,31 @@ export default function SMCDashboard() {
   const [autoRefresh, setAuto] = useState(false);
   const [lastUpdate, setLast]  = useState(null);
   const [activeTab, setTab]    = useState("confluence");
+  const [levelTfs, setLevelTfs]         = useState(() => loadPref("smc.levelTfs", []));
+  const [levelCurrent, setLevelCurrent] = useState(() => loadPref("smc.levelCurrent", false));
+  const [showSessions, setShowSessions] = useState(() => loadPref("smc.showSessions", false));
+  const [levelsOpen, setLevelsOpen]     = useState(false);
+  const [htf, setHtf]                   = useState({ symbol: null, byTf: {} });
+  const [levelsErr, setLevelsErr]       = useState(null);
 
   const chartRef   = useRef(null);
+  const oscRef     = useRef(null);
   const chartInst  = useRef(null);
+  const oscInst    = useRef(null);
   const candleSer  = useRef(null);
+  const oscSer     = useRef(null);
+  const canvasRef  = useRef(null);
   const markerApi  = useRef(null);
+  const divSer     = useRef(null);
   const seriesRefs = useRef([]);
+  const ohlcRef    = useRef([]);
+  const amdRef     = useRef(null);
+  const syncingRef = useRef(false);
   const timerRef   = useRef(null);
   const riskTimer  = useRef(null);
+  const levelSer   = useRef([]);
+  const levelsBox  = useRef(null);
+  const sessRef    = useRef({ enabled: false, tfSec: 0, serverTime: false });
 
   // ── Fetch analysis ──────────────────────────────────────────────────────────
   const fetchData = useCallback(async () => {
@@ -396,6 +925,52 @@ export default function SMCDashboard() {
     return () => clearTimeout(initialFetch);
   }, [fetchData]);
 
+  // ── Levels dropdown: persist choices, close on outside click ────────────────
+  useEffect(() => {
+    savePref("smc.levelTfs", levelTfs);
+    savePref("smc.levelCurrent", levelCurrent);
+    savePref("smc.showSessions", showSessions);
+  }, [levelTfs, levelCurrent, showSessions]);
+
+  useEffect(() => {
+    if (!levelsOpen) return;
+    const onDown = (e) => {
+      if (levelsBox.current && !levelsBox.current.contains(e.target)) setLevelsOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [levelsOpen]);
+
+  // Session breaks live on the canvas overlay; redraw when toggled
+  const chartTf    = data?.timeframe || tf;
+  const serverTime = !!data?.mt5_connected && !useMock;
+  useEffect(() => {
+    sessRef.current = {
+      enabled: showSessions && TF_SEC[chartTf] < TF_SEC.D1,
+      tfSec: TF_SEC[chartTf],
+      serverTime,
+    };
+    drawOverlay(canvasRef.current, chartInst.current, candleSer.current, amdRef.current, ohlcRef.current, sessRef.current);
+  }, [showSessions, chartTf, serverTime]);
+
+  // Fetch the few higher-timeframe candles needed for the selected high/low levels
+  useEffect(() => {
+    if (!levelTfs.length) return;
+    let cancelled = false;
+    const needed = [...new Set(levelTfs.map(t => (t === "W1" ? "D1" : t)))];
+    Promise.all(needed.map(async (t) => {
+      const res = await fetch(`${API}/candles?symbol=${symbol}&timeframe=${t}&count=${t === "D1" ? 15 : 5}&use_mock=${useMock}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `HTTP ${res.status}`);
+      }
+      return [t, (await res.json()).candles];
+    }))
+      .then((entries) => { if (!cancelled) { setHtf({ symbol, byTf: Object.fromEntries(entries) }); setLevelsErr(null); } })
+      .catch((e) => { if (!cancelled) setLevelsErr(e.message); });
+    return () => { cancelled = true; };
+  }, [symbol, useMock, levelTfs, data]);
+
   // ── Chart ───────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (!chartRef.current) return;
@@ -419,10 +994,58 @@ export default function SMCDashboard() {
         wickUpColor: C.green, wickDownColor: C.red,
       });
       const ro = new ResizeObserver(() => {
-        if (chartInst.current && chartRef.current)
-          chartInst.current.resize(chartRef.current.clientWidth, 520);
+        if (chartInst.current && chartRef.current) {
+          const w = chartRef.current.clientWidth;
+          chartInst.current.resize(w, 520);
+          if (canvasRef.current) {
+            canvasRef.current.width = w;
+            canvasRef.current.height = 520;
+          }
+        }
+        if (oscInst.current && oscRef.current) {
+          oscInst.current.resize(oscRef.current.clientWidth, 120);
+        }
+        drawOverlay(canvasRef.current, chartInst.current, candleSer.current, amdRef.current, ohlcRef.current, sessRef.current);
       });
       ro.observe(chartRef.current);
+      chartInst.current.timeScale().subscribeVisibleTimeRangeChange(() => {
+        drawOverlay(canvasRef.current, chartInst.current, candleSer.current, amdRef.current, ohlcRef.current, sessRef.current);
+      });
+    }
+
+    if (!oscInst.current && oscRef.current) {
+      oscInst.current = createChart(oscRef.current, {
+        layout: { background: { color: C.bg }, textColor: C.muted2, fontFamily: "monospace", fontSize: 10 },
+        grid:   { vertLines: { color: C.border }, horzLines: { color: C.border } },
+        crosshair: {
+          mode: CrosshairMode.Normal,
+          vertLine: { color: C.border2, labelBackgroundColor: C.surface2 },
+          horzLine: { color: C.border2, labelBackgroundColor: C.surface2 },
+        },
+        rightPriceScale: { borderColor: C.border, scaleMargins: { top: 0.1, bottom: 0.1 } },
+        timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false, visible: false },
+        width: oscRef.current.clientWidth,
+        height: 120,
+      });
+      oscSer.current = oscInst.current.addSeries(HistogramSeries, {
+        color: C.blue,
+        priceFormat: { type: "price", precision: 5, minMove: 0.00001 },
+        priceLineVisible: false,
+        lastValueVisible: false,
+      });
+
+      chartInst.current.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+        if (!range || !oscInst.current || syncingRef.current) return;
+        syncingRef.current = true;
+        oscInst.current.timeScale().setVisibleLogicalRange(range);
+        syncingRef.current = false;
+      });
+      oscInst.current.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+        if (!range || !chartInst.current || syncingRef.current) return;
+        syncingRef.current = true;
+        chartInst.current.timeScale().setVisibleLogicalRange(range);
+        syncingRef.current = false;
+      });
     }
 
     if (!data?.candles?.length) return;
@@ -432,7 +1055,46 @@ export default function SMCDashboard() {
       time:  Math.floor(new Date(c.time).getTime() / 1000),
       open: c.open, high: c.high, low: c.low, close: c.close,
     }));
+    ohlcRef.current = ohlc;
+    amdRef.current = data.amd || null;
+    if (canvasRef.current && chartRef.current) {
+      canvasRef.current.width = chartRef.current.clientWidth;
+      canvasRef.current.height = 520;
+    }
     candleSer.current.setData(ohlc);
+
+    if (oscSer.current) {
+      const oscData = buildOscillatorData(ohlc, data.oscillator_data);
+      oscSer.current.setData(oscData.map((d) => ({
+        ...d,
+        color: d.value >= 0 ? C.green : C.red,
+      })));
+
+      if (divSer.current) {
+        try { oscInst.current.removeSeries(divSer.current); } catch {
+          // The divergence series can already be gone after a quick refresh.
+        }
+        divSer.current = null;
+      }
+      if (oscInst.current && data.amd?.divergence_detected && data.amd?.divergence_indices?.length >= 2) {
+        const [i1, i2] = data.amd.divergence_indices;
+        if (ohlc[i1] && ohlc[i2] && oscData[i1] && oscData[i2]) {
+          divSer.current = oscInst.current.addSeries(LineSeries, {
+            color: C.red,
+            lineWidth: 2,
+            lineStyle: LineStyle.Dashed,
+            crosshairMarkerVisible: false,
+            lastValueVisible: false,
+            priceLineVisible: false,
+            title: "DIV",
+          });
+          divSer.current.setData([
+            { time: ohlc[i1].time, value: oscData[i1].value },
+            { time: ohlc[i2].time, value: oscData[i2].value },
+          ]);
+        }
+      }
+    }
 
     // Clear overlays
     seriesRefs.current.forEach((s) => {
@@ -444,6 +1106,7 @@ export default function SMCDashboard() {
 
     const t0 = ohlc[0].time;
     const t1 = ohlc[ohlc.length - 1].time;
+    const drawLegacyZones = false;
 
     const addH = (val, color, lw, ls, title, showLabel = true) => {
       if (!val || val === 0) return;
@@ -459,12 +1122,10 @@ export default function SMCDashboard() {
     };
 
     // 1. PDZ
-    addH(data.premium_zone,  C.orange, 1, LineStyle.Dashed,  "Premium");
     addH(data.equilibrium,   C.muted,  1, LineStyle.Dotted,  "EQ 50%");
-    addH(data.discount_zone, C.blue,   1, LineStyle.Dashed,  "Discount");
 
     // 2. FVGs
-    (data.fvgs || []).forEach((fvg) => {
+    drawLegacyZones && (data.fvgs || []).forEach((fvg) => {
       if (fvg.filled) return;
       const isBull = fvg.direction === "bullish";
       const color  = isBull ? C.fvgBull : C.fvgBear;
@@ -476,7 +1137,7 @@ export default function SMCDashboard() {
     });
 
     // 3. Order Blocks
-    (data.order_blocks || []).forEach((ob) => {
+    drawLegacyZones && (data.order_blocks || []).forEach((ob) => {
       if (ob.broken) return;
       const color = ob.direction === "bullish" ? C.obBull : C.obBear;
       addBand(chartInst.current, t0, t1, ob.top, ob.bottom, color, LineStyle.Solid,
@@ -484,7 +1145,7 @@ export default function SMCDashboard() {
     });
 
     // 4. OTE
-    if (data.ote_low != null && data.ote_high != null)
+    if (drawLegacyZones && data.ote_low != null && data.ote_high != null)
       addBand(chartInst.current, t0, t1, data.ote_high, data.ote_low, C.ote,
         LineStyle.LargeDashed, "OTE 62–79%", seriesRefs);
 
@@ -493,15 +1154,15 @@ export default function SMCDashboard() {
     addH(data.choch_level, C.purple, 2, LineStyle.LargeDashed, "CHoCH");
 
     // 6. Liquidity levels
-    (data.liquidity_levels || []).slice(0, 14).forEach((lvl) => {
+    (data.liquidity_levels || []).filter(l => !l.swept).slice(0, 8).forEach((lvl) => {
       const isHigh = lvl.level_type === "equal_high";
       addH(
         lvl.price,
-        lvl.swept ? C.border2 : (isHigh ? C.amber : C.purple),
-        lvl.swept ? 1 : (lvl.touches >= 3 ? 2 : 1),
-        lvl.swept ? LineStyle.Dotted : LineStyle.SparseDotted,
-        lvl.swept ? "" : (isHigh ? "EQH" : "EQL"),
-        !lvl.swept,
+        isHigh ? C.amber : C.purple,
+        lvl.touches >= 3 ? 2 : 1,
+        LineStyle.SparseDotted,
+        isHigh ? "BUYSIDE LIQUIDITY" : "SELLSIDE LIQUIDITY",
+        true,
       );
     });
 
@@ -525,6 +1186,10 @@ export default function SMCDashboard() {
     // 9. AMD phase levels
     if (data.amd?.manipulation?.extreme) {
       addH(data.amd.manipulation.extreme, C.amber, 2, LineStyle.Dashed, "Manip");
+    }
+    // MSS confirmed level (purple horizontal)
+    if (data.amd?.mss_level) {
+      addH(data.amd.mss_level, "#d070ff", 2, LineStyle.LargeDashed, "MSS Level");
     }
     if (data.amd?.manipulation_sl) {
       addH(data.amd.manipulation_sl, C.red, 1, LineStyle.SparseDotted, "AMD SL", false);
@@ -554,6 +1219,60 @@ export default function SMCDashboard() {
       if (!time || !s.label) return;
       markers.push({ time, position: "belowBar", color: s.label === "LL" ? C.green : "#145c3c", shape: "arrowUp", text: s.label });
     });
+    if (data.amd?.manipulation?.candle_index != null) {
+      const mssTime = ohlc[data.amd.manipulation.candle_index]?.time;
+      if (mssTime) {
+        const isBearhunt = data.amd.manipulation.direction === "bearish_hunt";
+        markers.push({
+          time: mssTime,
+          position: isBearhunt ? "aboveBar" : "belowBar",
+          color: "#d070ff",
+          shape: isBearhunt ? "arrowDown" : "arrowUp",
+          text: "MANIP",
+        });
+      }
+    }
+    // MSS level marker (confirmed structural shift candle)
+    if (data.amd?.mss_detected && data.amd?.mss_level) {
+      // Find closest candle to MSS level (proxy: scan post-manip candles)
+      const manipIdx = data.amd?.manipulation?.candle_index ?? 0;
+      let bestIdx = -1, bestDiff = Infinity;
+      for (let i = manipIdx + 1; i < ohlc.length; i++) {
+        // MSS for bearish = candle whose high ≈ mss_level
+        const ref = data.amd.manipulation?.direction === "bearish_hunt"
+          ? ohlc[i]?.high ?? 0
+          : ohlc[i]?.low ?? 0;
+        const diff = Math.abs(ref - data.amd.mss_level);
+        if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+        if (i > manipIdx + 30) break;
+      }
+      if (bestIdx >= 0 && ohlc[bestIdx]) {
+        const isBearhunt = data.amd.manipulation?.direction === "bearish_hunt";
+        markers.push({
+          time: ohlc[bestIdx].time,
+          position: isBearhunt ? "aboveBar" : "belowBar",
+          color: "#a040ff",
+          shape: isBearhunt ? "arrowDown" : "arrowUp",
+          text: "MSS",
+        });
+      }
+    }
+    // Divergence pivot markers
+    if (data.amd?.divergence_detected && data.amd?.divergence_indices?.length >= 2) {
+      const [di1, di2] = data.amd.divergence_indices;
+      const isBearhunt = data.amd.manipulation?.direction === "bearish_hunt";
+      [di1, di2].forEach((idx, n) => {
+        if (ohlc[idx]) {
+          markers.push({
+            time: ohlc[idx].time,
+            position: isBearhunt ? "aboveBar" : "belowBar",
+            color: C.red,
+            shape: isBearhunt ? "arrowDown" : "arrowUp",
+            text: n === 0 ? "DIV①" : "DIV②",
+          });
+        }
+      });
+    }
     if (markers.length) {
       markers.sort((a, b) => a.time - b.time);
       if (!markerApi.current) { markerApi.current = createSeriesMarkers(candleSer.current, markers); }
@@ -561,7 +1280,59 @@ export default function SMCDashboard() {
     } else if (markerApi.current) { markerApi.current.setMarkers([]); }
 
     chartInst.current.timeScale().fitContent();
+    oscInst.current?.timeScale().fitContent();
+    setTimeout(() => {
+      drawOverlay(canvasRef.current, chartInst.current, candleSer.current, data.amd, ohlc, sessRef.current);
+    }, 60);
   }, [data]);
+
+  // ── Higher-timeframe high / low lines ───────────────────────────────────────
+  useEffect(() => {
+    const chart = chartInst.current;
+    levelSer.current.forEach((s) => {
+      try { chart?.removeSeries(s); } catch {
+        // Series can already be detached after a quick refresh.
+      }
+    });
+    levelSer.current = [];
+
+    const ohlc = ohlcRef.current;
+    if (!chart || ohlc.length < 2 || !levelTfs.length || htf.symbol !== data?.symbol) return;
+
+    const n      = ohlc.length;
+    const tEnd   = ohlc[n - 1].time;
+    const nowMs  = Date.now();
+    const nowSec = nowMs / 1000 + chartOffsetSec(nowMs, serverTime);
+
+    const addLevel = (bar, tf, current) => {
+      let i = ohlc.findIndex(c => c.time >= bar.time);
+      if (i < 0 || i > n - 2) i = n - 2;          // period starts past the chart's last bar
+      [["H", bar.high], ["L", bar.low]].forEach(([hl, value]) => {
+        const s = chart.addSeries(LineSeries, {
+          color: LEVEL_COLORS[tf],
+          lineWidth: current ? 1 : 2,
+          lineStyle: current ? LineStyle.Dotted : LineStyle.Dashed,
+          crosshairMarkerVisible: false,
+          lastValueVisible: true,
+          priceLineVisible: false,
+          title: levelLabel(tf, hl, current),
+          autoscaleInfoProvider: () => null,      // far-away weekly levels must not squash the chart
+        });
+        s.setData([{ time: ohlc[i].time, value }, { time: tEnd, value }]);
+        levelSer.current.push(s);
+      });
+    };
+
+    levelTfs.filter(t => TF_SEC[t] > TF_SEC[chartTf]).forEach((t) => {
+      const raw = htf.byTf[t === "W1" ? "D1" : t];
+      if (!raw?.length) return;
+      let bars = raw.map(c => ({ time: Math.floor(Date.parse(c.time) / 1000), high: c.high, low: c.low }));
+      if (t === "W1") bars = groupWeekly(bars);
+      const { prev, cur } = htfLevels(bars, t, nowSec);
+      if (prev) addLevel(prev, t, false);
+      if (cur && levelCurrent) addLevel(cur, t, true);
+    });
+  }, [htf, levelTfs, levelCurrent, data, chartTf, serverTime]);
 
   // ── Derived ─────────────────────────────────────────────────────────────────
   const trendColor  = !data ? "gray" : data.trend === "BULLISH" ? "green" : data.trend === "BEARISH" ? "red" : "gray";
@@ -585,9 +1356,9 @@ export default function SMCDashboard() {
     });
   })();
 
-  // PDZ gate detection — backend warning contains "premium" or "discount"
+  // PDZ gate detection — v4 engine uses "hard suppression active" wording
   const pdZgateBlocked = data?.warnings?.some(
-    w => w.toLowerCase().includes("premium zone") || w.toLowerCase().includes("discount zone")
+    w => w.toLowerCase().includes("premium zone") || w.toLowerCase().includes("discount zone") || w.toLowerCase().includes("hard suppression")
   );
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -599,7 +1370,7 @@ export default function SMCDashboard() {
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <h1 style={{ margin: 0, fontSize: 20, fontWeight: 800, letterSpacing: -0.5 }}>SMC Engine</h1>
-            <Badge label="v3.1" color="blue" small />
+            <Badge label="v4.0" color="blue" small />
             {data && <Badge label={data.mt5_connected ? "● MT5 Live" : "○ Mock"} color={data.mt5_connected ? "green" : "gray"} small />}
             {riskData?.halted && <Badge label="⛔ HALTED" color="red" small />}
           </div>
@@ -617,6 +1388,9 @@ export default function SMCDashboard() {
           )}
         </div>
       </div>
+
+      {/* ── Bot ── */}
+      <BotPanel />
 
       {/* ── Controls ── */}
       <div style={{
@@ -658,6 +1432,67 @@ export default function SMCDashboard() {
           <span style={{ fontSize: 10, color: C.muted }}>pips</span>
         </div>
 
+        {/* Levels dropdown: HTF high/low + session breaks */}
+        <div ref={levelsBox} style={{ position: "relative" }}>
+          {(() => {
+            const active = levelTfs.length > 0 || showSessions;
+            return (
+              <button onClick={() => setLevelsOpen(o => !o)} style={{
+                ...btnSt,
+                background: active ? C.blueDim : "transparent",
+                color:      active ? C.blue : C.muted2,
+                border:     `1px solid ${active ? C.blue : C.border}`,
+              }}>
+                Levels{active ? ` (${levelTfs.length + (showSessions ? 1 : 0)})` : ""} ▾
+              </button>
+            );
+          })()}
+          {levelsOpen && (
+            <div style={{
+              position: "absolute", top: "calc(100% + 6px)", left: 0, zIndex: 50, width: 240,
+              background: C.surface2, border: `1px solid ${C.border2}`, borderRadius: 10,
+              padding: 12, boxShadow: "0 10px 28px rgba(0,0,0,0.5)",
+            }}>
+              <div style={ddLabelSt}>High / Low of timeframe</div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, marginBottom: 8 }}>
+                {LEVEL_TFS.map((t) => {
+                  const disabled = TF_SEC[t] <= TF_SEC[tf];
+                  const checked  = levelTfs.includes(t);
+                  return (
+                    <label key={t} title={disabled ? `Not shown on a ${tf} chart — pick a lower chart timeframe` : undefined}
+                      style={{ ...chkSt, opacity: disabled ? 0.35 : 1, cursor: disabled ? "not-allowed" : "pointer" }}>
+                      <input type="checkbox" checked={checked} disabled={disabled} style={{ accentColor: LEVEL_COLORS[t] }}
+                        onChange={() => setLevelTfs(cur => (checked ? cur.filter(x => x !== t) : [...cur, t]))} />
+                      <span style={{ color: checked ? LEVEL_COLORS[t] : C.muted2, fontWeight: checked ? 700 : 400 }}>{t}</span>
+                    </label>
+                  );
+                })}
+              </div>
+              <label style={{ ...chkSt, fontSize: 11 }}>
+                <input type="checkbox" checked={levelCurrent} onChange={e => setLevelCurrent(e.target.checked)} style={{ accentColor: C.blue }} />
+                Also show current (forming) candle
+              </label>
+              <div style={{ fontSize: 10, color: C.muted, marginTop: 4, lineHeight: 1.4 }}>
+                Dashed = previous candle (PDH / PDL, PWH / PWL…) · dotted = current
+              </div>
+
+              <div style={{ borderTop: `1px solid ${C.border2}`, margin: "10px 0" }} />
+
+              <div style={ddLabelSt}>Sessions</div>
+              <label style={{ ...chkSt, opacity: TF_SEC[tf] >= TF_SEC.D1 ? 0.35 : 1 }}>
+                <input type="checkbox" checked={showSessions} onChange={e => setShowSessions(e.target.checked)}
+                  disabled={TF_SEC[tf] >= TF_SEC.D1} style={{ accentColor: C.blue }} />
+                Show session breaks
+              </label>
+              <div style={{ display: "flex", gap: 8, marginTop: 5, fontSize: 10 }}>
+                {SESSIONS.map(s => <span key={s.name} style={{ color: s.color }}>│ {s.name}</span>)}
+              </div>
+
+              {levelsErr && <div style={{ marginTop: 8, fontSize: 11, color: C.red }}>✗ Levels: {levelsErr}</div>}
+            </div>
+          )}
+        </div>
+
         <label style={chkSt}>
           <input type="checkbox" checked={useMock} onChange={e => setMock(e.target.checked)} style={{ accentColor: C.blue }} />
           Mock
@@ -687,7 +1522,7 @@ export default function SMCDashboard() {
       )}
 
       {/* ── Chart ── */}
-      <div style={{ background: C.bg, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden", marginBottom: 14 }}>
+      <div style={{ background: C.bg, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden", marginBottom: 14, position: "relative" }}>
         {data && (
           <div style={{
             display: "flex", gap: 12, padding: "9px 14px",
@@ -699,6 +1534,8 @@ export default function SMCDashboard() {
             {data.last_event && <Badge label={data.last_event} color="blue" />}
             <Badge label={data.signal} color={signalColor} />
             {data.amd?.phase && <Badge label={`AMD ${data.amd.phase}`} color={amdPhaseColor} />}
+            {data.amd?.mss_detected && <Badge label="MSS" color="purple" small />}
+            {data.amd?.divergence_detected && <Badge label="DIVERGENCE" color="red" small />}
             {data.setup_type && <Badge label={data.setup_type.replace(/_/g, " ")} color="purple" small />}
             {/* Session badge — coloured by liquidity */}
             {data.scalp_filter?.session && (
@@ -729,12 +1566,19 @@ export default function SMCDashboard() {
           borderBottom: `1px solid ${C.border}`, flexWrap: "wrap",
         }}>
           {[
+            { c: "rgba(245,166,35,0.5)", l: "Accumulation" },
+            { c: "rgba(240,71,106,0.5)", l: "Manipulation" },
+            { c: "rgba(32,214,138,0.5)", l: "Distribution" },
+            { c: "#d070ff", l: "MSS" },
+            { c: C.amber, l: "Buyside Liq" },
+            { c: C.purple, l: "Sellside Liq" },
             { c: C.amber,   l: "EQH/EQL" }, { c: C.fvgBull, l: "FVG▲" }, { c: C.fvgBear, l: "FVG▼" },
             { c: C.obBull,  l: "OB▲" },     { c: C.obBear,  l: "OB▼" },  { c: C.ote,     l: "OTE" },
             { c: C.orange,  l: "Premium" },  { c: C.blue,    l: "Discount" }, { c: C.muted, l: "EQ" },
             { c: C.blue,    l: "Entry" },    { c: C.green,   l: "TP" },    { c: C.red,     l: "SL" },
-            { c: C.purple,  l: "CHoCH" },    { c: C.amber,   l: "AMD Manip" },
-          ].map(({ c, l }) => (
+            { c: C.amber,  l: "Manip Extreme" },
+            { c: "#d070ff", l: "MSS Level" },
+          ].filter(({ l }) => !l.includes("FVG") && !l.includes("OB") && !["OTE", "Premium", "Discount"].includes(l)).map(({ c, l }) => (
             <span key={l} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10, color: C.muted }}>
               <span style={{ width: 10, height: 2, background: c, display: "inline-block", borderRadius: 1 }} />
               {l}
@@ -742,6 +1586,38 @@ export default function SMCDashboard() {
           ))}
         </div>
         <div ref={chartRef} style={{ width: "100%", height: 520 }} />
+        <canvas
+          ref={canvasRef}
+          width={800}
+          height={520}
+          style={{
+            position: "absolute",
+            bottom: 120,
+            left: 0,
+            width: "100%",
+            height: 520,
+            pointerEvents: "none",
+            zIndex: 10,
+          }}
+        />
+        <div style={{ borderTop: `1px solid ${C.border}`, position: "relative" }}>
+          <div style={{
+            position: "absolute", top: 4, left: 10, zIndex: 5,
+            fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: 1,
+            display: "flex", alignItems: "center", gap: 6,
+          }}>
+            <span>Oscillator</span>
+            {data?.amd?.divergence_detected && (
+              <span style={{
+                color: C.red, fontSize: 9, fontWeight: 700,
+                border: `1px solid ${C.red}`, borderRadius: 3, padding: "0 4px",
+              }}>
+                DIVERGENCE
+              </span>
+            )}
+          </div>
+          <div ref={oscRef} style={{ width: "100%", height: 120 }} />
+        </div>
       </div>
 
       {data && (
@@ -815,6 +1691,23 @@ export default function SMCDashboard() {
               }}>
                 {data.rr_ratio > 0 ? `1 : ${data.rr_ratio}` : "—"}
               </div>
+              {(() => {
+                const rrTargets = data.amd?.rr_targets || computeRRTargets(
+                  data.amd?.entry_zone_high || data.entry_zone?.[1],
+                  data.amd?.manipulation_sl || data.stop_loss,
+                );
+                if (!rrTargets) return null;
+                return (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 8 }}>
+                    {Object.entries(rrTargets).map(([label, price]) => (
+                      <div key={label} style={{ display: "flex", justifyContent: "space-between", fontSize: 10 }}>
+                        <span style={{ color: C.muted }}>{label}</span>
+                        <span style={{ color: C.green, fontFamily: "monospace" }}>{fmtPrice(price, data.symbol)}</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
             </div>
 
             {/* Structure */}
@@ -1174,7 +2067,7 @@ export default function SMCDashboard() {
       )}
 
       <p style={{ marginTop: 14, fontSize: 10, color: C.muted, textAlign: "center" }}>
-        SMC Engine v3.1 · Not financial advice · Always manage risk · {data?.symbol} {data?.timeframe}
+        SMC Engine v4.0 · Not financial advice · Always manage risk · {data?.symbol} {data?.timeframe}
       </p>
     </div>
   );
@@ -1193,6 +2086,9 @@ const btnSt = {
 const chkSt = {
   display: "flex", alignItems: "center", gap: 5,
   fontSize: 12, color: "#7a84a0", cursor: "pointer",
+};
+const ddLabelSt = {
+  fontSize: 10, color: "#5a6480", textTransform: "uppercase", letterSpacing: 1, marginBottom: 8,
 };
 const cardSt = {
   background: "#111318", border: "1px solid #1d2231",

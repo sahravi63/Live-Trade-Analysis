@@ -87,6 +87,7 @@ class ScalpOrchestrator:
         timeframe: str = "M5",
         spread_pips: Optional[float] = None,
         dt: Optional[datetime] = None,
+        amd: Optional[AMDResult] = None,        # pass from api.py to avoid double compute
     ) -> ScalpDecision:
 
         now = (dt or datetime.now(timezone.utc)).isoformat()
@@ -94,7 +95,10 @@ class ScalpOrchestrator:
         block_reasons: list[str] = []
 
         # ── Layer 0: AMD Phase ────────────────────────────────────────────────
-        amd = analyze_amd(candles, current_price)
+        # Reuse the caller's AMD result when provided (api.py already computed it).
+        # Only run analyze_amd here when called standalone (e.g. tests).
+        if amd is None:
+            amd = analyze_amd(candles, current_price)
 
         # ── Layer 1: SMC Signal ───────────────────────────────────────────────
         smc = decide(
