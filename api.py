@@ -11,11 +11,12 @@ Changes over v4:
 
 import json
 import os
+import threading
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
+from pydantic import BaseModel, Field
+from typing import Literal, Optional
 import traceback
 
 from data_connector import fetch_candles, MT5_AVAILABLE
@@ -195,6 +196,30 @@ class AnalysisResponse(BaseModel):
     # Raw data
     candles: list[dict]
     mt5_connected: bool
+
+
+class ManualPaperTradeRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    direction: Literal["BUY", "SELL"]
+    signal: Literal["BUY", "SELL", "WAIT"]
+    entry: float
+    stop_loss: float
+    take_profit: float
+    bar_time: str
+    setup: str = "MANUAL"
+    confidence: float = 0.0
+
+
+class PaperFundsRequest(BaseModel):
+    amount: float = Field(gt=0, allow_inf_nan=False)
+
+
+class PaperPositionUpdateRequest(BaseModel):
+    stop_loss: float = Field(gt=0, allow_inf_nan=False)
+    take_profit: float = Field(gt=0, allow_inf_nan=False)
+    lots: float = Field(gt=0, allow_inf_nan=False)
+    bar_time: str
 
 
 @app.get("/analyze", response_model=AnalysisResponse)
@@ -403,6 +428,8 @@ def health():
 # ══════════════════════════════════════════════════════════════════════════════
 
 _bot: Optional[MarketBot] = None
+_paper_monitor_stop = threading.Event()
+_paper_monitor_thread: Optional[threading.Thread] = None
 
 
 def get_bot() -> MarketBot:
@@ -410,6 +437,37 @@ def get_bot() -> MarketBot:
     if _bot is None:
         _bot = MarketBot(load_config())
     return _bot
+
+
+def _paper_monitor_loop() -> None:
+    while not _paper_monitor_stop.wait(15):
+        try:
+            bot = get_bot()
+            if not bot.running and not bot.external_running():
+                bot.monitor_open_positions()
+        except Exception as e:
+            print(f"[paper-monitor] could not monitor open positions: {e}")
+
+
+@app.on_event("startup")
+def start_paper_monitor() -> None:
+    global _paper_monitor_thread
+    if _paper_monitor_thread and _paper_monitor_thread.is_alive():
+        return
+    _paper_monitor_stop.clear()
+    _paper_monitor_thread = threading.Thread(
+        target=_paper_monitor_loop,
+        name="paper-position-monitor",
+        daemon=True,
+    )
+    _paper_monitor_thread.start()
+
+
+@app.on_event("shutdown")
+def stop_paper_monitor() -> None:
+    _paper_monitor_stop.set()
+    if _paper_monitor_thread:
+        _paper_monitor_thread.join(timeout=2)
 
 
 @app.get("/bot/status")
@@ -445,6 +503,63 @@ def bot_scan_once():
     return {"rows": b.scan_once(), "scanned_at": b.last_scan_at}
 
 
+@app.post("/bot/manual-trade")
+def bot_manual_trade(request: ManualPaperTradeRequest):
+    b = get_bot()
+    if b.external_running():
+        raise HTTPException(
+            409, "A bot is running in a terminal; stop it before placing a manual paper trade.",
+        )
+    try:
+        position = b.open_manual_paper_trade(
+            symbol=request.symbol,
+            timeframe=request.timeframe,
+            direction=request.direction,
+            entry=request.entry,
+            stop_loss=request.stop_loss,
+            take_profit=request.take_profit,
+            bar_time=request.bar_time,
+            setup=request.setup,
+            confidence=request.confidence,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(409, str(e)) from e
+
+    return {"status": "opened", "position": position.__dict__}
+
+
+@app.post("/bot/positions/{position_id}/close")
+def bot_close_position(position_id: str):
+    b = get_bot()
+    if b.external_running():
+        raise HTTPException(409, "A bot is running in a terminal; close positions through that bot's API process.")
+    try:
+        position = b.close_paper_position(position_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"status": "closed", "position": position.__dict__}
+
+
+@app.patch("/bot/positions/{position_id}")
+def bot_update_position(position_id: str, request: PaperPositionUpdateRequest):
+    b = get_bot()
+    if b.external_running():
+        raise HTTPException(409, "A bot is running in a terminal; adjust positions through that bot's API process.")
+    try:
+        position = b.update_paper_position(
+            position_id,
+            request.stop_loss,
+            request.take_profit,
+            request.lots,
+            request.bar_time,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"status": "updated", "position": position.__dict__}
+
+
 @app.get("/bot/journal")
 def bot_journal(limit: int = Query(50, ge=1, le=500)):
     path = get_bot().journal_path
@@ -465,6 +580,28 @@ def bot_reset_paper():
     b.orch.reset_day(bal)
     b._save_risk()
     return {"status": "reset", "balance": bal}
+
+
+def _adjust_paper_funds(action: str, request: PaperFundsRequest):
+    b = get_bot()
+    if b.external_running():
+        raise HTTPException(
+            409, "A bot is running in a terminal; adjust paper funds through that bot's API process.",
+        )
+    try:
+        return {"status": action, **b.adjust_paper_funds(action, request.amount)}
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.post("/bot/paper-account/deposit")
+def paper_account_deposit(request: PaperFundsRequest):
+    return _adjust_paper_funds("deposit", request)
+
+
+@app.post("/bot/paper-account/withdraw")
+def paper_account_withdraw(request: PaperFundsRequest):
+    return _adjust_paper_funds("withdraw", request)
 
 
 @app.get("/bot/backtest")

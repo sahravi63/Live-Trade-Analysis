@@ -51,14 +51,29 @@ _SL_BOUNDS_OVERRIDE: dict[str, tuple[float, float]] = {
 
 def _pip_size(symbol: str) -> float:
     s = symbol.upper()
-    if "XAU" in s or "GOLD" in s or "JPY" in s:
+    if any(asset in s for asset in ("XAU", "GOLD", "JPY", "XAG", "OIL", "WTI", "ETH")):
         return 0.01
+    if "BTC" in s or s in {"US30", "USTECH", "NAS100", "SPX500", "UK100"}:
+        return 1.0
     return 0.0001
 
 
 def _get_pip_value(symbol: str) -> float:
     """USD value of one pip for one standard lot (approximate, static table)."""
-    return _PIP_VALUE_TABLE.get(symbol.upper(), 10.0)
+    s = symbol.upper()
+    if s in _PIP_VALUE_TABLE:
+        return _PIP_VALUE_TABLE[s]
+    if any(asset in s for asset in ("XAU", "GOLD")):
+        return 1.0
+    if "XAG" in s:
+        return 0.5
+    if any(asset in s for asset in ("OIL", "WTI")):
+        return 10.0
+    if "BTC" in s or "ETH" in s:
+        return 10.0
+    if s in {"US30", "USTECH", "NAS100", "SPX500", "UK100"}:
+        return 10.0
+    return 10.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -149,6 +164,8 @@ class RiskManager:
         return None
 
     def _check_daily_loss(self) -> Optional[str]:
+        if self.balance <= 0:
+            return "Account balance is zero or negative"
         loss_pct = abs(min(self.state.daily_pnl, 0)) / self.balance
         if loss_pct >= self.max_daily_loss_pct:
             self.state.halted = True
@@ -188,6 +205,7 @@ class RiskManager:
         """
         Calculate lot size and check all risk rules before allowing entry.
         """
+        direction = direction.upper()
         # Run hard gates
         for check in [
             self._check_halt,
@@ -284,17 +302,18 @@ class RiskManager:
     # ── Status ────────────────────────────────────────────────────────────────
 
     def status(self) -> dict:
+        balance = self.balance if self.balance > 0 else 1.0
         return {
             "balance": self.balance,
             "daily_pnl": round(self.state.daily_pnl, 2),
-            "daily_pnl_pct": round(self.state.daily_pnl / self.balance * 100, 3),
+            "daily_pnl_pct": round(self.state.daily_pnl / balance * 100, 3),
             "open_trades": len(self.state.open_trades),
             "consecutive_losses": self.state.consecutive_losses,
             "halted": self.state.halted,
             "halt_reason": self.state.halt_reason,
             "trades_today": len(self.state.trade_log),
             "daily_loss_remaining_pct": round(
-                self.max_daily_loss_pct - abs(min(self.state.daily_pnl, 0)) / self.balance,
+                self.max_daily_loss_pct - abs(min(self.state.daily_pnl, 0)) / balance,
                 4,
             ),
         }

@@ -173,8 +173,13 @@ def get_spread_pips(symbol: str) -> Optional[float]:
 # Yahoo Finance (free, no key)
 # ══════════════════════════════════════════════════════════════════════════════
 
-YAHOO_SYMBOLS = {"XAUUSD": "GC=F", "XAGUSD": "SI=F", "BTCUSD": "BTC-USD",
-                 "ETHUSD": "ETH-USD", "US30": "^DJI", "NAS100": "^NDX", "SPX500": "^GSPC"}
+YAHOO_SYMBOLS = {
+    "XAUUSD": "GC=F", "XAGUSD": "SI=F",
+    "BTCUSD": "BTC-USD", "ETHUSD": "ETH-USD",
+    "USOIL": "CL=F",
+    "USTECH": "^NDX", "NAS100": "^NDX",
+    "US30": "^DJI", "SPX500": "^GSPC", "UK100": "^FTSE",
+}
 YAHOO_TF = {  # timeframe -> (interval, range, aggregate_factor)
     "M1": ("1m", "5d", 1), "M5": ("5m", "30d", 1), "M15": ("15m", "30d", 1),
     "M30": ("30m", "30d", 1), "H1": ("60m", "180d", 1), "H4": ("60m", "365d", 4),
@@ -298,8 +303,10 @@ def generate_mock_candles(n: int = 200, base_price: float = 1.08500,
 
 def pip_size(symbol: str) -> float:
     s = symbol.upper()
-    if "XAU" in s or "GOLD" in s or "JPY" in s:
+    if any(asset in s for asset in ("XAU", "GOLD", "JPY", "XAG", "OIL", "WTI", "ETH")):
         return 0.01
+    if "BTC" in s or s in {"US30", "USTECH", "NAS100", "SPX500", "UK100"}:
+        return 1.0
     return 0.0001
 
 

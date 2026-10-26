@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import ctypes
 import json
+import math
 import os
 import sys
 import threading
@@ -51,7 +53,7 @@ from scalp_orchestrator import ScalpOrchestrator
 from risk_manager import RiskManager
 from timemachine import monte_carlo, historical_replay, verdict
 from news_filter import NewsFilter
-from paper_broker import PaperBroker
+from paper_broker import PaperBroker, Position
 from alerts import Alerter
 
 OUT_DIR = os.path.join(BASE_DIR, "bot_output")
@@ -107,6 +109,31 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _pid_is_running(pid: int) -> bool:
+    try:
+        pid = int(pid)
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            open_process = kernel32.OpenProcess
+            open_process.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            open_process.restype = wintypes.HANDLE
+            handle = open_process(0x1000, False, pid)
+            if handle:
+                kernel32.CloseHandle(handle)
+                return True
+            return ctypes.get_last_error() == 5
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def _write_json(path: str, data) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -152,6 +179,7 @@ class MarketBot:
         self.journal_path = os.path.join(out_dir, "journal.jsonl")
         self.scan_path = os.path.join(out_dir, "latest_scan.json")
         self._recent_entries: dict[str, float] = {}
+        self._trade_lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.running = False
@@ -213,7 +241,9 @@ class MarketBot:
             try:
                 with open(self.lock_path, encoding="utf-8") as fh:
                     d = json.load(fh)
-                if d.get("pid") != os.getpid() and time.time() - d.get("heartbeat", 0) < stale_after:
+                pid = d.get("pid")
+                if (pid != os.getpid() and _pid_is_running(pid)
+                        and time.time() - d.get("heartbeat", 0) < stale_after):
                     raise RuntimeError(
                         f"another bot (pid {d.get('pid')}) is already running — stop it first")
             except (OSError, ValueError):
@@ -343,6 +373,10 @@ class MarketBot:
         return row
 
     def _execute(self, row: dict, d, sig, bar_time: str, key: str) -> str:
+        with self._trade_lock:
+            return self._execute_locked(row, d, sig, bar_time, key)
+
+    def _execute_locked(self, row: dict, d, sig, bar_time: str, key: str) -> str:
         mode = self.cfg["execution"]["mode"]
         sym, tf, dirn = row["symbol"], row["timeframe"], sig.signal.value
         tm = row.get("timemachine") or {}
@@ -380,27 +414,235 @@ class MarketBot:
         self.alerter.send(f"{label} {dirn} {sym} {tf} [{sig.setup_type}] #{p.id}", body, "trade")
         return f"opened {label.lower()} #{p.id}"
 
-    def _manage_positions(self, symbol: str, tf: str, candles: list[dict]) -> None:
-        closed = self.broker.update(symbol, tf, candles)
-        # MT5 demo positions: ask the broker whether they have closed
-        for p in self.broker.open_positions(symbol):
-            if p.mode == "mt5-demo" and p.ticket:
-                from mt5_executor import position_closed_pnl
-                res = position_closed_pnl(p.ticket)
-                if res:
-                    exit_price, pnl = res
-                    self.broker.close(p, exit_price, "closed on MT5")
-                    p.pnl = pnl
-                    self.broker.save()
-                    closed.append(p)
-        for p in closed:
-            self.orch.close_trade(p.id, p.pnl)
+    def open_manual_paper_trade(
+        self,
+        symbol: str,
+        timeframe: str,
+        direction: str,
+        entry: float,
+        stop_loss: float,
+        take_profit: float,
+        bar_time: str,
+        setup: str = "",
+        confidence: float = 0.0,
+    ):
+        """Open a manual paper trade after applying the bot's core risk limits."""
+        direction = direction.upper()
+        if direction not in ("BUY", "SELL"):
+            raise ValueError("Direction must be BUY or SELL.")
+        if not all(math.isfinite(value) and value > 0
+                   for value in (entry, stop_loss, take_profit)):
+            raise ValueError("Entry, stop loss, and take profit must be positive finite prices.")
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            raise ValueError("Confidence must be between 0 and 1.")
+        try:
+            datetime.fromisoformat(bar_time)
+        except (TypeError, ValueError) as e:
+            raise ValueError("Invalid candle time for the manual trade.") from e
+
+        with self._trade_lock:
+            self._roll_day()
+            if self.broker.open_positions(symbol):
+                raise RuntimeError(f"Already in a trade on {symbol}.")
+
+            if direction == "BUY" and not stop_loss < entry < take_profit:
+                raise ValueError("BUY levels are invalid at the current entry price.")
+            if direction == "SELL" and not take_profit < entry < stop_loss:
+                raise ValueError("SELL levels are invalid at the current entry price.")
+
+            sizing = self.orch.risk_mgr.size_trade(
+                entry=entry, sl=stop_loss, symbol=symbol, direction=direction,
+            )
+            if not sizing.allowed:
+                raise RuntimeError(sizing.reason)
+
+            if direction == "BUY" and not sizing.sl_adjusted < entry < take_profit:
+                raise ValueError("Spread-adjusted BUY levels are invalid.")
+            if direction == "SELL" and not take_profit < entry < sizing.sl_adjusted:
+                raise ValueError("Spread-adjusted SELL levels are invalid.")
+
+            risk_distance = abs(entry - sizing.sl_adjusted)
+            rr = abs(take_profit - entry) / risk_distance if risk_distance else 0
+            min_rr = self.cfg["filters"]["min_rr"]
+            if rr < min_rr:
+                raise ValueError(
+                    f"Risk/reward {rr:.2f} is below the minimum {min_rr:.2f}."
+                )
+
+            position = self.broker.open(
+                symbol, timeframe, direction, entry, sizing.sl_adjusted, take_profit,
+                sizing.lots, sizing.risk_amount, bar_time,
+                setup=setup or "MANUAL", confidence=confidence, mode="paper",
+            )
+            self.orch.confirm_entry(position.id, entry)
             self._save_risk()
-            self._append_trade_csv(p)
-            self._journal("close", {"position": p.__dict__})
-            self.alerter.send(f"CLOSED {p.symbol} {p.direction} #{p.id} — {p.exit_reason}",
-                              f"P&L ${p.pnl:+.2f} ({p.r_multiple:+.2f}R) | equity ${self.broker.equity()}",
-                              "close")
+            self._journal("manual_open", {"position": position.__dict__})
+            self.alerter.send(
+                f"MANUAL PAPER {direction} {symbol} {timeframe} #{position.id}",
+                f"Entry {entry} | SL {position.sl} | TP {take_profit} | "
+                f"Lots {sizing.lots} | Risk ${sizing.risk_amount}",
+                "trade",
+            )
+            return position
+
+    def adjust_paper_funds(self, action: str, amount: float) -> dict:
+        """Adjust simulated cash only; never sends a broker deposit or withdrawal."""
+        if not math.isfinite(amount) or amount <= 0:
+            raise ValueError("Amount must be a positive finite number.")
+        with self._trade_lock:
+            self._roll_day()
+            if action == "deposit":
+                event = self.broker.deposit(amount)
+            elif action == "withdraw":
+                event = self.broker.withdraw(amount)
+            else:
+                raise ValueError("Action must be deposit or withdraw.")
+            self.orch.risk_mgr.balance = self.broker.balance()
+            self._save_risk()
+            self._journal("paper_funds", event)
+            return event
+
+    def close_paper_position(self, position_id: str) -> Position:
+        with self._trade_lock:
+            position = next(
+                (p for p in self.broker.open_positions() if p.id == position_id),
+                None,
+            )
+            if position is None:
+                raise ValueError(f"Open paper position {position_id} was not found.")
+            if position.mode != "paper":
+                raise ValueError("Only paper positions can be closed from the dashboard.")
+
+            exit_price = position.mark_price if position.mark_price is not None else position.entry
+            self.broker.close(position, exit_price, "manual close")
+            self.orch.close_trade(position.id, position.pnl)
+            self.orch.risk_mgr.balance = self.broker.balance()
+            self._save_risk()
+            self._append_trade_csv(position)
+            self._journal("close", {"position": position.__dict__})
+            self.alerter.send(
+                f"CLOSED {position.symbol} {position.direction} #{position.id} — manual close",
+                f"P&L ${position.pnl:+.2f} ({position.r_multiple:+.2f}R) | "
+                f"equity ${self.broker.equity()}",
+                "close",
+            )
+            return position
+
+    def update_paper_position(
+        self,
+        position_id: str,
+        stop_loss: float,
+        take_profit: float,
+        lots: float,
+        bar_time: str,
+    ) -> Position:
+        with self._trade_lock:
+            position = next(
+                (p for p in self.broker.open_positions() if p.id == position_id),
+                None,
+            )
+            if position is None:
+                raise ValueError(f"Open paper position {position_id} was not found.")
+            if position.mode != "paper":
+                raise ValueError("Only paper positions can be adjusted from the dashboard.")
+            position = self.broker.update_position(
+                position,
+                stop_loss,
+                take_profit,
+                lots,
+                bar_time,
+                max_risk_amount=self.orch.risk_mgr._dollar_risk(),
+                spread_buffer_pips=self.orch.risk_mgr.spread_buffer_pips,
+            )
+            self._journal("position_level_update", {
+                "position_id": position.id,
+                "symbol": position.symbol,
+                "stop_loss": position.sl,
+                "take_profit": position.tp,
+                "lots": position.lots,
+                "risk_amount": position.risk_amount,
+            })
+            return position
+
+    def _manage_positions(self, symbol: str, tf: str, candles: list[dict]) -> None:
+        with self._trade_lock:
+            closed = self.broker.update(symbol, tf, candles)
+            # MT5 demo positions: ask the broker whether they have closed
+            for p in self.broker.open_positions(symbol):
+                if p.mode == "mt5-demo" and p.ticket:
+                    from mt5_executor import position_closed_pnl
+                    res = position_closed_pnl(p.ticket)
+                    if res:
+                        exit_price, pnl = res
+                        calculated_pnl = p.pnl
+                        self.broker.close(p, exit_price, "closed on MT5")
+                        p.pnl = pnl
+                        self.broker.cash_balance = round(
+                            self.broker.cash_balance + pnl - calculated_pnl, 2,
+                        )
+                        self.broker.save()
+                        closed.append(p)
+            for p in closed:
+                self.orch.close_trade(p.id, p.pnl)
+                self.orch.risk_mgr.balance = self.broker.balance()
+                self._save_risk()
+                self._append_trade_csv(p)
+                self._journal("close", {"position": p.__dict__})
+                self.alerter.send(f"CLOSED {p.symbol} {p.direction} #{p.id} — {p.exit_reason}",
+                                  f"P&L ${p.pnl:+.2f} ({p.r_multiple:+.2f}R) | equity ${self.broker.equity()}",
+                                  "close")
+
+    def _manage_unconfigured_positions(self) -> list[str]:
+        """Monitor manually opened symbol/timeframes outside the bot scan grid."""
+        configured = {
+            (symbol, timeframe)
+            for symbol in self.cfg["watchlist"]
+            for timeframe in self.cfg["timeframes"]
+        }
+        checked = set()
+        errors = []
+        for position in self.broker.open_positions():
+            pair = (position.symbol, position.timeframe)
+            if pair in configured or pair in checked:
+                continue
+            checked.add(pair)
+            try:
+                candles = dc.fetch_candles(
+                    position.symbol,
+                    position.timeframe,
+                    self.cfg["candles"],
+                    source=self.cfg["data_source"],
+                )
+                self._manage_positions(position.symbol, position.timeframe, candles)
+            except Exception as e:
+                errors.append(f"{position.symbol} {position.timeframe} paper monitoring: {e}")
+        return errors
+
+    def monitor_open_positions(self) -> list[str]:
+        """Refresh all paper positions when the automatic signal bot is stopped."""
+        if self.running or self.external_running():
+            return []
+        self.refresh_from_disk()
+        self._load_risk()
+        positions = self.broker.open_positions()
+        pairs = {(position.symbol, position.timeframe) for position in positions}
+        errors = []
+        for symbol, timeframe in pairs:
+            try:
+                candles = dc.fetch_candles(
+                    symbol,
+                    timeframe,
+                    self.cfg["candles"],
+                    source=self.cfg["data_source"],
+                )
+                self._manage_positions(symbol, timeframe, candles)
+            except Exception as e:
+                errors.append(f"{symbol} {timeframe} paper monitoring: {e}")
+        if errors:
+            for error in errors:
+                print(f"[paper-monitor] {error}")
+        self.last_errors = errors
+        return errors
 
     # ── full scan ───────────────────────────────────────────────────────────
     def scan_once(self) -> list[dict]:
@@ -418,6 +660,7 @@ class MarketBot:
                                  "time": _now().isoformat()})
                     if os.getenv("BOT_DEBUG"):
                         traceback.print_exc()
+        errors.extend(self._manage_unconfigured_positions())
         self.cycles += 1
         self.last_scan_at = _now().isoformat()
         self.last_rows, self.last_errors = rows, errors
@@ -480,7 +723,8 @@ class MarketBot:
         except (OSError, ValueError):
             return False
         stale_after = max(180, 3 * self.cfg["scan_interval_seconds"])
-        return bool(d.get("pid")) and d.get("pid") != os.getpid() and \
+        pid = d.get("pid")
+        return bool(pid) and pid != os.getpid() and _pid_is_running(pid) and \
             time.time() - d.get("heartbeat", 0) < stale_after
 
     def refresh_from_disk(self) -> None:
@@ -515,6 +759,7 @@ class MarketBot:
             "alert_channels": self.alerter.channels,
             "risk": self.orch.risk_status(),
             "paper": self.broker.stats(),
+            "funding_events": self.broker.funding_events[-10:][::-1],
             "open_positions": [p.__dict__ for p in self.broker.open_positions()],
             "recent_closed": [p.__dict__ for p in closed[-15:]][::-1],
             "upcoming_news": self.news.upcoming(self.cfg["watchlist"], 24)[:10],

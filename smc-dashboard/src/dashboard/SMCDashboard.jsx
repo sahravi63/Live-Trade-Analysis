@@ -15,7 +15,7 @@
  *  10.  Chart MSS marker now uses mss_level (if set) instead of manip close
  */
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { Fragment, useEffect, useRef, useState, useCallback } from "react";
 import {
   CandlestickSeries,
   createChart,
@@ -33,6 +33,7 @@ const COUNT_OPTIONS   = [100, 200, 300, 500];
 const SYMBOL_OPTIONS  = [
   "EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","NZDUSD","USDCAD",
   "GBPJPY","EURJPY","EURGBP","XAUUSD",
+  "BTCUSD","USOIL","USTECH","ETHUSD","XAGUSD","US30","SPX500","UK100",
 ];
 
 // ── Colour palette ─────────────────────────────────────────────────────────────
@@ -85,19 +86,19 @@ const AMD_BOX = {
   accumulation: {
     fill: "rgba(245,166,35,0.13)",
     stroke: "rgba(245,166,35,0.55)",
-    label: "ACCUMULATION",
+    label: "ACCUM",
     labelColor: C.amber,
   },
   manipulation: {
     fill: "rgba(240,71,106,0.12)",
     stroke: "rgba(240,71,106,0.50)",
-    label: "MANIPULATION",
+    label: "MANIP",
     labelColor: C.red,
   },
   distribution: {
     fill: "rgba(32,214,138,0.12)",
     stroke: "rgba(32,214,138,0.50)",
-    label: "DISTRIBUTION",
+    label: "DIST",
     labelColor: C.green,
   },
 };
@@ -105,21 +106,72 @@ const AMD_BOX = {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 const fmt    = (n, d = 5) => (n == null || n === 0 ? "—" : Number(n).toFixed(d));
 const fmtPct = (n)        => (n == null ? "—" : Number(n).toFixed(1) + "%");
-// JPY pairs use 2-decimal pips (0.01), all others 4-decimal (0.0001)
+const pipSize = (sym) => {
+  const s = (sym || "").toUpperCase();
+  if (s.includes("JPY") || s.includes("XAU") || s.includes("GOLD")
+    || s.includes("XAG") || s.includes("OIL") || s.includes("WTI")) return 0.01;
+  if (s.includes("BTC") || ["US30", "USTECH", "NAS100", "SPX500", "UK100"].includes(s)) return 1;
+  if (s.includes("ETH")) return 0.01;
+  return 0.0001;
+};
 const pipDiff = (a, b, sym) => {
   if (a == null || b == null || a === 0 || b === 0) return "—";
-  const isJpy = sym && sym.toUpperCase().includes("JPY");
-  const mult  = isJpy ? 100 : 10000;
-  return (Math.abs(a - b) * mult).toFixed(1) + "p";
+  return (Math.abs(a - b) / pipSize(sym)).toFixed(1) + "p";
 };
 const priceDecimals = (sym) => {
   const s = (sym || "").toUpperCase();
-  if (s.includes("XAU") || s.includes("GOLD")) return 2;
+  if (s.includes("XAU") || s.includes("GOLD") || s.includes("XAG")
+    || s.includes("OIL") || s.includes("WTI") || s.includes("BTC") || s.includes("ETH")) return 2;
+  if (["US30", "USTECH", "NAS100", "SPX500", "UK100"].includes(s)) return 2;
   if (s.includes("JPY")) return 3;
   return 5;
 };
 const fmtPrice = (n, sym) => fmt(n, priceDecimals(sym));
 const clk = () => new Date().toLocaleTimeString();
+
+function manualTradeLevels(direction, data) {
+  if (!data?.candles?.length) return null;
+  const entry = Number(data.current_price);
+  if (!Number.isFinite(entry) || entry <= 0) return null;
+
+  const minimumRR = Math.max(Number(data.rr_ratio) || 0, 1.8);
+  const buffer = pipSize(data.symbol);
+  const ensureRiskReward = (stopLoss, takeProfit) => {
+    const risk = Math.abs(entry - stopLoss) + buffer;
+    const reward = Math.abs(takeProfit - entry);
+    const adjustedReward = Math.max(reward, risk * minimumRR * 1.02);
+    return direction === "BUY"
+      ? { entry, stopLoss, takeProfit: entry + adjustedReward }
+      : { entry, stopLoss, takeProfit: entry - adjustedReward };
+  };
+
+  const stopLoss = Number(data.stop_loss);
+  const takeProfit = Number(data.take_profit);
+  const signalLevelsValid = data.signal === direction && (direction === "BUY"
+    ? stopLoss < entry && entry < takeProfit
+    : takeProfit < entry && entry < stopLoss);
+  if (signalLevelsValid) return ensureRiskReward(stopLoss, takeProfit);
+
+  const candles = data.candles;
+  const ranges = candles.slice(1).map((candle, index) => {
+    const previousClose = candles[index].close;
+    return Math.max(
+      candle.high - candle.low,
+      Math.abs(candle.high - previousClose),
+      Math.abs(candle.low - previousClose),
+    );
+  });
+  const recentRanges = ranges.slice(-14);
+  const atr = recentRanges.length
+    ? recentRanges.reduce((sum, value) => sum + value, 0) / recentRanges.length
+    : 0;
+  if (!Number.isFinite(atr) || atr <= 0) return null;
+
+  const riskDistance = atr * 1.5;
+  const fallbackStop = direction === "BUY" ? entry - riskDistance : entry + riskDistance;
+  const fallbackTarget = direction === "BUY" ? entry + riskDistance : entry - riskDistance;
+  return ensureRiskReward(fallbackStop, fallbackTarget);
+}
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
 
@@ -362,13 +414,13 @@ function AMDSetupCard({ data }) {
 
 // Chart band helper
 function addBand(chart, t0, t1, top, bot, color, lStyle, title, refs) {
-  const mkLine = (val, lbl) => {
+  const mkLine = (val, title) => {
     const s = chart.addSeries(LineSeries, {
       color, lineWidth: 1, lineStyle: lStyle,
       crosshairMarkerVisible: false,
-      lastValueVisible: !!lbl,
+      lastValueVisible: false,
       priceLineVisible: false,
-      title: lbl || "",
+      title: title || "",
     });
     s.setData([{ time: t0, value: val }, { time: t1, value: val }]);
     refs.current.push(s);
@@ -442,11 +494,11 @@ function drawAMDBoxes(canvas, chart, candleSeries, amd, ohlcData) {
 
     ctx.font = "bold 11px 'JetBrains Mono', monospace";
     ctx.fillStyle = cfg.labelColor;
-    ctx.fillText(cfg.label, left + 6, top + 15);
+    ctx.fillText(cfg.label, left + 6, top + 15, Math.max(0, boxW - 12));
 
     if (extraLabel) {
       ctx.font = "bold 10px 'JetBrains Mono', monospace";
-      ctx.fillText(extraLabel, left + 6, top + 28);
+      ctx.fillText(extraLabel, left + 6, top + 28, Math.max(0, boxW - 12));
     }
 
     return { left, right, top, bottom };
@@ -463,30 +515,13 @@ function drawAMDBoxes(canvas, chart, candleSeries, amd, ohlcData) {
     const isBearhunt = manip.direction === "bearish_hunt";
     const boxHigh = isBearhunt ? manip.extreme : acc.high;
     const boxLow = isBearhunt ? acc.low : manip.extreme;
-    const bounds = drawBox(
+    drawBox(
       ohlcData[acc.end_index].time,
       ohlcData[manip.candle_index].time,
       boxHigh,
       boxLow,
       AMD_BOX.manipulation,
     );
-    const mssY = priceToY(manip.close || (boxHigh + boxLow) / 2);
-    if (bounds.right != null && mssY != null) {
-      ctx.font = "bold 10px 'JetBrains Mono', monospace";
-      ctx.fillStyle = "#d070ff";
-      ctx.strokeStyle = C.purpleDim;
-      ctx.lineWidth = 3;
-      ctx.strokeText("MSS", bounds.right - 28, mssY - 6);
-      ctx.fillText("MSS", bounds.right - 28, mssY - 6);
-      ctx.beginPath();
-      ctx.moveTo(bounds.right, mssY - 10);
-      ctx.lineTo(bounds.right, mssY + 10);
-      ctx.strokeStyle = "#d070ff";
-      ctx.lineWidth = 1.5;
-      ctx.setLineDash([2, 2]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-    }
   }
 
   if (manip && amd.distribution_started && ohlcData[manip.candle_index]) {
@@ -527,39 +562,12 @@ function drawAMDBoxes(canvas, chart, candleSeries, amd, ohlcData) {
     }
   }
 
-  if (amd.divergence_detected && amd.divergence_indices?.length >= 2) {
-    const [i1, i2] = amd.divergence_indices;
-    if (ohlcData[i1] && ohlcData[i2]) {
-      const x1 = timeToX(ohlcData[i1].time);
-      const x2 = timeToX(ohlcData[i2].time);
-      const y1 = priceToY(ohlcData[i1].high + (ohlcData[i1].high - ohlcData[i1].low) * 0.3);
-      const y2 = priceToY(ohlcData[i2].high + (ohlcData[i2].high - ohlcData[i2].low) * 0.3);
-      if (x1 != null && x2 != null && y1 != null && y2 != null) {
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(x2, y2);
-        ctx.strokeStyle = C.red;
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([4, 3]);
-        ctx.stroke();
-        ctx.setLineDash([]);
-        ctx.font = "bold 10px 'JetBrains Mono', monospace";
-        ctx.fillStyle = C.red;
-        ctx.fillText("DIVERGENCE", (x1 + x2) / 2 - 30, (y1 + y2) / 2 - 10);
-      }
-    }
-  }
 }
 
 // ── Higher-timeframe levels + session breaks ──────────────────────────────────
 const TF_SEC     = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400, W1: 604800 };
 const LEVEL_TFS  = ["M15", "M30", "H1", "H4", "D1", "W1"];
 const LEVEL_COLORS = { M15: C.teal, M30: C.blue, H1: C.purple, H4: C.orange, D1: C.amber, W1: C.red };
-const levelLabel = (tf, hl, current) => {
-  if (tf === "D1") return current ? `Today ${hl}` : `PD${hl}`;
-  if (tf === "W1") return current ? `Week ${hl}`  : `PW${hl}`;
-  return current ? `${tf} ${hl}` : `Prev ${tf} ${hl}`;
-};
 
 const SESSIONS = [
   { name: "TOKYO",    tz: "Asia/Tokyo",       hour: 9, color: C.amber },
@@ -683,23 +691,44 @@ function sessionColor(session) {
 // ── Bot control panel (polls /bot/status, start/stop the scan loop) ────────────
 const fmtTime = (iso) => (iso ? new Date(iso).toLocaleTimeString() : "—");
 
-function BotPanel() {
+function BotPanel({ onClosePosition, onUpdatePosition, onShowPosition, orderDrafts, setOrderDrafts }) {
   const [bot,     setBot]     = useState(null);
   const [busy,    setBusy]    = useState(false);
+  const [fundsBusy, setFundsBusy] = useState(false);
+  const [fundsAmount, setFundsAmount] = useState("1000");
+  const [fundsMessage, setFundsMessage] = useState(null);
+  const [closeBusy, setCloseBusy] = useState(null);
+  const [updateBusy, setUpdateBusy] = useState(null);
+  const [orderMessage, setOrderMessage] = useState(null);
   const [botErr,  setBotErr]  = useState(null);
-  const [open,    setOpen]    = useState(true);
+  const [open,    setOpen]    = useState(false);
 
   const fetchBot = useCallback(async () => {
     try {
       const res = await fetch(`${API}/bot/status`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setBot(await res.json());
+      const nextBot = await res.json();
+      setBot(nextBot);
+      setOrderDrafts(current => {
+        const positions = nextBot.open_positions || [];
+        const nextDrafts = Object.fromEntries(positions.map(position => [
+          position.id,
+          current[position.id] || {
+            sl: String(position.sl),
+            tp: String(position.tp),
+            lots: String(position.lots),
+          },
+        ]));
+        const unchanged = Object.keys(current).length === positions.length
+          && positions.every(position => current[position.id] === nextDrafts[position.id]);
+        return unchanged ? current : nextDrafts;
+      });
       setBotErr(null);
     } catch (e) {
       setBot(null);
       setBotErr(`API unreachable (${e.message})`);
     }
-  }, []);
+  }, [setOrderDrafts]);
 
   useEffect(() => {
     const first = setTimeout(fetchBot, 0);
@@ -720,15 +749,110 @@ function BotPanel() {
     finally     { setBusy(false); }
   };
 
+  const adjustFunds = async (action) => {
+    const amount = Number(fundsAmount);
+    if (!Number.isFinite(amount) || amount < 0.01) {
+      setFundsMessage({ type: "error", text: "Enter an amount of at least $0.01." });
+      return;
+    }
+    setFundsBusy(true);
+    setFundsMessage(null);
+    try {
+      const res = await fetch(`${API}/bot/paper-account/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amount }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      await fetchBot();
+      setFundsMessage({
+        type: "success",
+        text: `Simulated ${action === "deposit" ? "deposit" : "withdrawal"} of $${amount.toFixed(2)} complete.`,
+      });
+    } catch (e) {
+      setFundsMessage({ type: "error", text: e.message });
+    } finally {
+      setFundsBusy(false);
+    }
+  };
+
+  const closePosition = async (position) => {
+    const price = position.mark_price ?? position.entry;
+    if (!window.confirm(
+      `Close paper ${position.direction} ${position.symbol} ${position.timeframe} at approximately ${fmtPrice(price, position.symbol)}?`,
+    )) return;
+    setCloseBusy(position.id);
+    setOrderMessage(null);
+    try {
+      await onClosePosition(position.id);
+      await fetchBot();
+      setOrderMessage({ type: "success", text: `${position.symbol} paper order closed.` });
+    } catch (e) {
+      setOrderMessage({ type: "error", text: e.message });
+    } finally {
+      setCloseBusy(null);
+    }
+  };
+
   const running = !!bot?.running;
   const paper   = bot?.paper || {};
+  const openPositions = bot?.open_positions || [];
+  const recentClosed = bot?.recent_closed || [];
   const rows    = bot?.rows || [];
   const ready   = rows.filter(r => r.ready);
   const pending = rows.filter(r => !r.ready && (r.signal === "BUY" || r.signal === "SELL"));
 
+  const editOrderDraft = (position, field, value) => {
+    setOrderDrafts(current => ({
+      ...current,
+      [position.id]: { ...current[position.id], [field]: value },
+    }));
+  };
+
+  const stepOrderDraft = (position, field, sign) => {
+    const current = orderDrafts[position.id];
+    if (!current) return;
+    const step = field === "lots" ? 0.01 : pipSize(position.symbol);
+    const digits = field === "lots" ? 2 : priceDecimals(position.symbol);
+    editOrderDraft(position, field, String((Number(current[field]) + sign * step).toFixed(digits)));
+  };
+
+  const updatePosition = async (position) => {
+    const draft = orderDrafts[position.id];
+    const values = {
+      stop_loss: Number(draft?.sl),
+      take_profit: Number(draft?.tp),
+      lots: Number(draft?.lots),
+    };
+    if (!Object.values(values).every(Number.isFinite)) {
+      setOrderMessage({ type: "error", text: "Enter valid SL, TP, and lot values." });
+      return;
+    }
+    setUpdateBusy(position.id);
+    setOrderMessage(null);
+    try {
+      const updated = await onUpdatePosition(position, values);
+      setOrderDrafts(current => ({
+        ...current,
+        [position.id]: {
+          sl: String(updated.sl),
+          tp: String(updated.tp),
+          lots: String(updated.lots),
+        },
+      }));
+      await fetchBot();
+      setOrderMessage({ type: "success", text: `${position.symbol} order updated.` });
+    } catch (e) {
+      setOrderMessage({ type: "error", text: e.message });
+    } finally {
+      setUpdateBusy(null);
+    }
+  };
+
   return (
-    <div style={{ ...cardSt, marginBottom: 14, borderColor: running ? C.greenDim : C.border }}>
-      <div style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "center" }}>
+    <div id="market-bot-panel" className="bot-panel" style={{ ...cardSt, marginBottom: 14, borderColor: running ? C.greenDim : C.border }}>
+      <div className="bot-panel-summary" style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "center" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <span style={{
             width: 9, height: 9, borderRadius: 99,
@@ -768,6 +892,178 @@ function BotPanel() {
 
       {botErr && <div style={{ marginTop: 10, fontSize: 12, color: C.red }}>✗ {botErr}</div>}
       {bot?.risk?.halted && <div style={{ marginTop: 10, fontSize: 12, color: C.red, fontWeight: 700 }}>⛔ Trading halted: {bot.risk.halt_reason}</div>}
+
+      {bot && (
+        <div className="paper-account">
+          <div className="paper-account-heading">
+            <div>
+              <div className="paper-account-title">Demo account <Badge label="VIRTUAL FUNDS" color="teal" small /></div>
+              <div className="paper-account-note">
+                Paper simulation only · Latest price mark {fmtTime(bot.last_scan_at)}
+              </div>
+            </div>
+            <div className="paper-account-metrics">
+              <Stat label="Balance" value={`$${Number(paper.balance ?? paper.starting_balance ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`} color={C.text} />
+              <Stat label="Equity" value={`$${Number(paper.equity ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`} color={C.blue} />
+              <Stat label="Floating P&L" value={`${Number(paper.floating_pnl || 0) >= 0 ? "+" : ""}$${Number(paper.floating_pnl || 0).toFixed(2)}`} color={Number(paper.floating_pnl || 0) >= 0 ? C.green : C.red} />
+              <Stat label="Open orders" value={openPositions.length} color={C.text} />
+            </div>
+            <div className="paper-funding-controls">
+              <input
+                aria-label="Virtual account amount"
+                type="number"
+                min="0.01"
+                step="100"
+                value={fundsAmount}
+                onChange={e => setFundsAmount(e.target.value)}
+              />
+              <button onClick={() => adjustFunds("deposit")} disabled={fundsBusy || Number(fundsAmount) < 0.01} className="fund-deposit">
+                {fundsBusy ? "…" : "Deposit"}
+              </button>
+              <button onClick={() => adjustFunds("withdraw")} disabled={fundsBusy || Number(fundsAmount) < 0.01} className="fund-withdraw">
+                {fundsBusy ? "…" : "Withdraw"}
+              </button>
+            </div>
+          </div>
+          {fundsMessage && (
+            <div className={`funds-message ${fundsMessage.type}`}>{fundsMessage.text}</div>
+          )}
+          {orderMessage && (
+            <div className={`funds-message ${orderMessage.type}`}>{orderMessage.text}</div>
+          )}
+
+          <div className="order-status-section">
+            <SecTitle right={`${openPositions.length} open`}>Order status</SecTitle>
+            {openPositions.length === 0 ? (
+              <div className="empty-orders">No open paper orders. Orders you place will appear here.</div>
+            ) : (
+              <div className="order-table-wrap">
+                <table className="order-table">
+                  <thead><tr>
+                    <th>Status</th><th>Side</th><th>Symbol / TF</th><th>Entry</th><th>Mark</th><th>SL</th><th>TP</th><th>Lots</th><th>Floating P&L</th><th>Action</th>
+                  </tr></thead>
+                  <tbody>{openPositions.map(p => {
+                    const draft = orderDrafts[p.id] || {
+                      sl: String(p.sl), tp: String(p.tp), lots: String(p.lots),
+                    };
+                    const draftChanged = Number(draft.sl) !== Number(p.sl)
+                      || Number(draft.tp) !== Number(p.tp)
+                      || Number(draft.lots) !== Number(p.lots);
+                    return (
+                      <Fragment key={p.id}>
+                        <tr>
+                          <td><Badge label="OPEN" color="blue" small /></td>
+                          <td className={p.direction === "BUY" ? "order-buy" : "order-sell"}>{p.direction}</td>
+                          <td>{p.symbol} · {p.timeframe}</td>
+                          <td>{fmtPrice(p.entry, p.symbol)}</td>
+                          <td>{fmtPrice(p.mark_price ?? p.entry, p.symbol)}</td>
+                          <td className="order-sell">{fmtPrice(p.sl, p.symbol)}</td>
+                          <td className="order-buy">{fmtPrice(p.tp, p.symbol)}</td>
+                          <td>{Number(p.lots).toFixed(2)}</td>
+                          <td className={Number(p.unrealized_pnl || 0) >= 0 ? "order-buy" : "order-sell"}>
+                            {Number(p.unrealized_pnl || 0) >= 0 ? "+" : ""}${Number(p.unrealized_pnl || 0).toFixed(2)}
+                          </td>
+                          <td>
+                            <button
+                              className="order-chart-button"
+                              onClick={() => onShowPosition(p)}
+                            >
+                              Chart
+                            </button>
+                            <button className="order-close-button" disabled={closeBusy === p.id} onClick={() => closePosition(p)}>
+                              {closeBusy === p.id ? "Closing…" : "Close"}
+                            </button>
+                          </td>
+                        </tr>
+                        <tr className="order-edit-row">
+                          <td colSpan="10">
+                            <div className="order-edit-controls">
+                              {[
+                                ["sl", "SL", p.sl],
+                                ["tp", "TP", p.tp],
+                              ].map(([field, label, original]) => (
+                                <div className="order-edit-field" key={field}>
+                                  <label htmlFor={`order-${p.id}-${field}`}>{label}</label>
+                                  <button
+                                    type="button"
+                                    className="order-step-button"
+                                    aria-label={`Decrease ${label}`}
+                                    onClick={() => stepOrderDraft(p, field, -1)}
+                                  >−</button>
+                                  <input
+                                    id={`order-${p.id}-${field}`}
+                                    type="number"
+                                    step={pipSize(p.symbol)}
+                                    value={draft[field]}
+                                    onChange={e => editOrderDraft(p, field, e.target.value)}
+                                  />
+                                  <button
+                                    type="button"
+                                    className="order-step-button"
+                                    aria-label={`Increase ${label}`}
+                                    onClick={() => stepOrderDraft(p, field, 1)}
+                                  >+</button>
+                                  <small>was {fmtPrice(original, p.symbol)}</small>
+                                </div>
+                              ))}
+                              <div className="order-edit-field lots">
+                                <label htmlFor={`order-${p.id}-lots`}>LOTS</label>
+                                <button
+                                  type="button"
+                                  className="order-step-button"
+                                  aria-label="Decrease lots"
+                                  onClick={() => stepOrderDraft(p, "lots", -1)}
+                                >−</button>
+                                <input
+                                  id={`order-${p.id}-lots`}
+                                  type="number"
+                                  min="0.01"
+                                  step="0.01"
+                                  value={draft.lots}
+                                  onChange={e => editOrderDraft(p, "lots", e.target.value)}
+                                />
+                                <button
+                                  type="button"
+                                  className="order-step-button"
+                                  aria-label="Increase lots"
+                                  onClick={() => stepOrderDraft(p, "lots", 1)}
+                                >+</button>
+                              </div>
+                              <button
+                                className="order-update-button"
+                                disabled={!draftChanged || updateBusy === p.id}
+                                onClick={() => updatePosition(p)}
+                              >
+                                {updateBusy === p.id ? "Updating…" : "Update"}
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      </Fragment>
+                    );
+                  })}</tbody>
+                </table>
+              </div>
+            )}
+            {recentClosed.length > 0 && (
+              <div className="recent-order-status">
+                <span>RECENTLY CLOSED</span>
+                {recentClosed.slice(0, 3).map(p => (
+                  <div key={p.id} className="recent-order-row">
+                    <Badge label="CLOSED" color="gray" small />
+                    <strong className={p.direction === "BUY" ? "order-buy" : "order-sell"}>{p.direction}</strong>
+                    <span>{p.symbol} · {p.timeframe}</span>
+                    <span>{p.exit_reason || "closed"}</span>
+                    <strong className={Number(p.pnl) >= 0 ? "order-buy" : "order-sell"}>
+                      {Number(p.pnl) >= 0 ? "+" : ""}${Number(p.pnl).toFixed(2)}
+                    </strong>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {open && bot && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 14, marginTop: 14 }}>
@@ -844,6 +1140,8 @@ export default function SMCDashboard() {
   const [spread,   setSpread]  = useState("");        // user-entered spread pips
   const [data,     setData]    = useState(null);
   const [riskData, setRiskData]= useState(null);
+  const [manualBusy, setManualBusy] = useState(false);
+  const [manualMessage, setManualMessage] = useState(null);
   const [loading,  setLoad]    = useState(false);
   const [err,      setErr]     = useState(null);
   const [autoRefresh, setAuto] = useState(false);
@@ -853,8 +1151,18 @@ export default function SMCDashboard() {
   const [levelCurrent, setLevelCurrent] = useState(() => loadPref("smc.levelCurrent", false));
   const [showSessions, setShowSessions] = useState(() => loadPref("smc.showSessions", false));
   const [levelsOpen, setLevelsOpen]     = useState(false);
+  const [chartLayersOpen, setChartLayersOpen] = useState(false);
+  const [chartLayers, setChartLayers] = useState({
+    structure: false,
+    liquidity: false,
+    tradePlan: false,
+    amd: false,
+  });
   const [htf, setHtf]                   = useState({ symbol: null, byTf: {} });
   const [levelsErr, setLevelsErr]       = useState(null);
+  const [openOrders, setOpenOrders]     = useState([]);
+  const [orderDrafts, setOrderDrafts]   = useState({});
+  const [orderActionMessage, setOrderActionMessage] = useState(null);
 
   const chartRef   = useRef(null);
   const oscRef     = useRef(null);
@@ -872,7 +1180,11 @@ export default function SMCDashboard() {
   const timerRef   = useRef(null);
   const riskTimer  = useRef(null);
   const levelSer   = useRef([]);
+  const orderLinesRef = useRef([]);
+  const orderDragRef = useRef(null);
   const levelsBox  = useRef(null);
+  const chartLayersBox = useRef(null);
+  const chartLayersRef = useRef(chartLayers);
   const sessRef    = useRef({ enabled: false, tfSec: 0, serverTime: false });
 
   // ── Fetch analysis ──────────────────────────────────────────────────────────
@@ -901,6 +1213,132 @@ export default function SMCDashboard() {
       // Risk status is optional; keep the dashboard usable if that endpoint is unavailable.
     }
   }, []);
+
+  const placeManualPaperTrade = useCallback(async (direction) => {
+    const levels = manualTradeLevels(direction, data);
+    if (!levels) {
+      setManualMessage({ type: "error", text: "Cannot create manual levels without valid current market data." });
+      return;
+    }
+    const { entry, stopLoss, takeProfit } = levels;
+    const overridesSignal = data.signal !== direction;
+    if (!window.confirm(
+      `Open a manual PAPER ${direction} on ${data.symbol} ${data.timeframe}?\n` +
+      `Entry: ${entry} | SL: ${stopLoss} | TP: ${takeProfit}` +
+      (overridesSignal ? `\nThis overrides the current ${data.signal} signal.` : ""),
+    )) return;
+
+    setManualBusy(true);
+    setManualMessage(null);
+    try {
+      const res = await fetch(`${API}/bot/manual-trade`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          symbol: data.symbol,
+          timeframe: data.timeframe,
+          direction,
+          signal: data.signal,
+          entry,
+          stop_loss: stopLoss,
+          take_profit: takeProfit,
+          bar_time: data.candles[data.candles.length - 1].time,
+          setup: overridesSignal ? "MANUAL_OVERRIDE" : (data.setup_type || "MANUAL"),
+          confidence: data.confidence || 0,
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+      const p = body.position;
+      setManualMessage({
+        type: "success",
+        text: `Opened paper ${direction} ${p.symbol} ${p.timeframe} · ${p.lots} lots · #${p.id}`,
+      });
+      fetchRisk();
+    } catch (e) {
+      setManualMessage({ type: "error", text: e.message });
+    } finally {
+      setManualBusy(false);
+    }
+  }, [data, fetchRisk]);
+
+  const fetchOpenOrders = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/bot/status`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      setOpenOrders(body.open_positions || []);
+    } catch (e) {
+      setOrderActionMessage({ type: "error", text: `Could not refresh paper orders: ${e.message}` });
+    }
+  }, []);
+
+  const closeOrder = useCallback(async (positionId) => {
+    const res = await fetch(`${API}/bot/positions/${encodeURIComponent(positionId)}/close`, {
+      method: "POST",
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+    setOrderActionMessage({
+      type: "success",
+      text: `Closed paper order ${body.position.symbol} ${body.position.direction}.`,
+    });
+    await fetchOpenOrders();
+    fetchRisk();
+  }, [fetchOpenOrders, fetchRisk]);
+
+  const updateOrder = useCallback(async (position, values) => {
+    const orderBarTime = data?.symbol === position.symbol && data?.timeframe === position.timeframe
+      ? data.candles?.[data.candles.length - 1]?.time
+      : null;
+    const res = await fetch(`${API}/bot/positions/${encodeURIComponent(position.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...values,
+        bar_time: orderBarTime || new Date().toISOString(),
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
+    setOrderActionMessage({
+      type: "success",
+      text: `SL, TP, and lots updated for ${body.position.symbol}.`,
+    });
+    await fetchOpenOrders();
+    fetchRisk();
+    return body.position;
+  }, [data, fetchOpenOrders, fetchRisk]);
+
+  const stageOrderLevel = useCallback((position, level, price) => {
+    const digits = priceDecimals(position.symbol);
+    setOrderDrafts(current => {
+      const draft = current[position.id] || {
+        sl: String(position.sl),
+        tp: String(position.tp),
+        lots: String(position.lots),
+      };
+      return {
+        ...current,
+        [position.id]: { ...draft, [level]: Number(price).toFixed(digits) },
+      };
+    });
+  }, []);
+
+  const showPositionOnChart = useCallback((position) => {
+    setSymbol(position.symbol);
+    setTf(position.timeframe);
+    document.getElementById("trade-chart")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, []);
+
+  useEffect(() => {
+    const initialFetch = setTimeout(fetchOpenOrders, 0);
+    const interval = setInterval(fetchOpenOrders, 5_000);
+    return () => {
+      clearTimeout(initialFetch);
+      clearInterval(interval);
+    };
+  }, [fetchOpenOrders]);
 
   // Auto-refresh analysis
   useEffect(() => {
@@ -933,13 +1371,26 @@ export default function SMCDashboard() {
   }, [levelTfs, levelCurrent, showSessions]);
 
   useEffect(() => {
-    if (!levelsOpen) return;
+    chartLayersRef.current = chartLayers;
+    drawOverlay(
+      canvasRef.current,
+      chartInst.current,
+      candleSer.current,
+      chartLayers.amd ? amdRef.current : null,
+      ohlcRef.current,
+      sessRef.current,
+    );
+  }, [chartLayers]);
+
+  useEffect(() => {
+    if (!levelsOpen && !chartLayersOpen) return;
     const onDown = (e) => {
       if (levelsBox.current && !levelsBox.current.contains(e.target)) setLevelsOpen(false);
+      if (chartLayersBox.current && !chartLayersBox.current.contains(e.target)) setChartLayersOpen(false);
     };
     document.addEventListener("mousedown", onDown);
     return () => document.removeEventListener("mousedown", onDown);
-  }, [levelsOpen]);
+  }, [levelsOpen, chartLayersOpen]);
 
   // Session breaks live on the canvas overlay; redraw when toggled
   const chartTf    = data?.timeframe || tf;
@@ -950,7 +1401,14 @@ export default function SMCDashboard() {
       tfSec: TF_SEC[chartTf],
       serverTime,
     };
-    drawOverlay(canvasRef.current, chartInst.current, candleSer.current, amdRef.current, ohlcRef.current, sessRef.current);
+    drawOverlay(
+      canvasRef.current,
+      chartInst.current,
+      candleSer.current,
+      chartLayersRef.current.amd ? amdRef.current : null,
+      ohlcRef.current,
+      sessRef.current,
+    );
   }, [showSessions, chartTf, serverTime]);
 
   // Fetch the few higher-timeframe candles needed for the selected high/low levels
@@ -986,7 +1444,7 @@ export default function SMCDashboard() {
         rightPriceScale: { borderColor: C.border, scaleMargins: { top: 0.08, bottom: 0.08 } },
         timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false },
         width: chartRef.current.clientWidth,
-        height: 520,
+        height: 390,
       });
       candleSer.current = chartInst.current.addSeries(CandlestickSeries, {
         upColor: C.green, downColor: C.red,
@@ -996,20 +1454,34 @@ export default function SMCDashboard() {
       const ro = new ResizeObserver(() => {
         if (chartInst.current && chartRef.current) {
           const w = chartRef.current.clientWidth;
-          chartInst.current.resize(w, 520);
+          chartInst.current.resize(w, 390);
           if (canvasRef.current) {
             canvasRef.current.width = w;
-            canvasRef.current.height = 520;
+            canvasRef.current.height = 390;
           }
         }
         if (oscInst.current && oscRef.current) {
           oscInst.current.resize(oscRef.current.clientWidth, 120);
         }
-        drawOverlay(canvasRef.current, chartInst.current, candleSer.current, amdRef.current, ohlcRef.current, sessRef.current);
+        drawOverlay(
+          canvasRef.current,
+          chartInst.current,
+          candleSer.current,
+          chartLayersRef.current.amd ? amdRef.current : null,
+          ohlcRef.current,
+          sessRef.current,
+        );
       });
       ro.observe(chartRef.current);
       chartInst.current.timeScale().subscribeVisibleTimeRangeChange(() => {
-        drawOverlay(canvasRef.current, chartInst.current, candleSer.current, amdRef.current, ohlcRef.current, sessRef.current);
+        drawOverlay(
+          canvasRef.current,
+          chartInst.current,
+          candleSer.current,
+          chartLayersRef.current.amd ? amdRef.current : null,
+          ohlcRef.current,
+          sessRef.current,
+        );
       });
     }
 
@@ -1059,7 +1531,7 @@ export default function SMCDashboard() {
     amdRef.current = data.amd || null;
     if (canvasRef.current && chartRef.current) {
       canvasRef.current.width = chartRef.current.clientWidth;
-      canvasRef.current.height = 520;
+      canvasRef.current.height = 390;
     }
     candleSer.current.setData(ohlc);
 
@@ -1108,12 +1580,12 @@ export default function SMCDashboard() {
     const t1 = ohlc[ohlc.length - 1].time;
     const drawLegacyZones = false;
 
-    const addH = (val, color, lw, ls, title, showLabel = true) => {
+    const addH = (val, color, lw, ls, title) => {
       if (!val || val === 0) return;
       const s = chartInst.current.addSeries(LineSeries, {
         color, lineWidth: lw, lineStyle: ls,
         crosshairMarkerVisible: false,
-        lastValueVisible: showLabel,
+        lastValueVisible: false,
         priceLineVisible: false,
         title,
       });
@@ -1121,8 +1593,11 @@ export default function SMCDashboard() {
       seriesRefs.current.push(s);
     };
 
-    // 1. PDZ
-    addH(data.equilibrium,   C.muted,  1, LineStyle.Dotted,  "EQ 50%");
+    if (chartLayers.structure) {
+      addH(data.equilibrium, C.muted, 1, LineStyle.Dotted, "EQ 50%");
+      addH(data.bos_level, C.blue, 2, LineStyle.LargeDashed, "BOS");
+      addH(data.choch_level, C.purple, 2, LineStyle.LargeDashed, "CHoCH");
+    }
 
     // 2. FVGs
     drawLegacyZones && (data.fvgs || []).forEach((fvg) => {
@@ -1149,77 +1624,70 @@ export default function SMCDashboard() {
       addBand(chartInst.current, t0, t1, data.ote_high, data.ote_low, C.ote,
         LineStyle.LargeDashed, "OTE 62–79%", seriesRefs);
 
-    // 5. BOS / CHoCH
-    addH(data.bos_level,   C.blue,   2, LineStyle.LargeDashed, "BOS");
-    addH(data.choch_level, C.purple, 2, LineStyle.LargeDashed, "CHoCH");
-
     // 6. Liquidity levels
-    (data.liquidity_levels || []).filter(l => !l.swept).slice(0, 8).forEach((lvl) => {
-      const isHigh = lvl.level_type === "equal_high";
-      addH(
-        lvl.price,
-        isHigh ? C.amber : C.purple,
-        lvl.touches >= 3 ? 2 : 1,
-        LineStyle.SparseDotted,
-        isHigh ? "BUYSIDE LIQUIDITY" : "SELLSIDE LIQUIDITY",
-        true,
-      );
-    });
+    if (chartLayers.liquidity) {
+      (data.liquidity_levels || []).filter(l => !l.swept).slice(0, 4).forEach((lvl) => {
+        const isHigh = lvl.level_type === "equal_high";
+        addH(lvl.price, isHigh ? C.amber : C.purple, 1, LineStyle.SparseDotted, "");
+      });
+      addH(data.nearest_buy_side, C.amber, 1, LineStyle.SparseDotted, "");
+      addH(data.nearest_sell_side, C.purple, 1, LineStyle.SparseDotted, "");
+    }
 
     // 7. Entry / SL / TP — only when signal is active and values are valid
     const hasSignal = data.signal !== "WAIT";
-    if (hasSignal && Array.isArray(data.entry_zone)) {
+    if (chartLayers.tradePlan && hasSignal && Array.isArray(data.entry_zone)) {
       addBand(chartInst.current, t0, t1,
         data.entry_zone[1], data.entry_zone[0], C.blue, LineStyle.Dashed, "Entry", seriesRefs);
       const entryMid = (data.entry_zone[0] + data.entry_zone[1]) / 2;
       addH(entryMid, C.blue, 2, LineStyle.Solid, "Entry Mid");
     }
     // Guard: stop_loss and take_profit can be 0 on WAIT signal
-    if (hasSignal && data.stop_loss  && data.stop_loss  !== 0) addH(data.stop_loss,   C.red,   2, LineStyle.Dashed, "SL");
-    if (hasSignal && data.take_profit && data.take_profit !== 0) addH(data.take_profit, C.green, 2, LineStyle.Dashed, "TP");
+    if (chartLayers.tradePlan && hasSignal && data.stop_loss && data.stop_loss !== 0) addH(data.stop_loss, C.red, 2, LineStyle.Dashed, "SL");
+    if (chartLayers.tradePlan && hasSignal && data.take_profit && data.take_profit !== 0) addH(data.take_profit, C.green, 2, LineStyle.Dashed, "TP");
 
     // 8. Exec levels from scalp layer (spread-adjusted, dashed)
-    if (hasSignal && data.exec_entry) addH(data.exec_entry, C.blue,  1, LineStyle.SparseDotted, "Exec Entry", false);
-    if (hasSignal && data.exec_sl)    addH(data.exec_sl,    C.red,   1, LineStyle.SparseDotted, "Exec SL",    false);
-    if (hasSignal && data.exec_tp)    addH(data.exec_tp,    C.green, 1, LineStyle.SparseDotted, "Exec TP",    false);
+    if (chartLayers.tradePlan && hasSignal && data.exec_entry) addH(data.exec_entry, C.blue, 1, LineStyle.SparseDotted, "");
+    if (chartLayers.tradePlan && hasSignal && data.exec_sl) addH(data.exec_sl, C.red, 1, LineStyle.SparseDotted, "");
+    if (chartLayers.tradePlan && hasSignal && data.exec_tp) addH(data.exec_tp, C.green, 1, LineStyle.SparseDotted, "");
 
     // 9. AMD phase levels
-    if (data.amd?.manipulation?.extreme) {
+    if (chartLayers.amd && data.amd?.manipulation?.extreme) {
       addH(data.amd.manipulation.extreme, C.amber, 2, LineStyle.Dashed, "Manip");
     }
     // MSS confirmed level (purple horizontal)
-    if (data.amd?.mss_level) {
+    if (chartLayers.amd && data.amd?.mss_level) {
       addH(data.amd.mss_level, "#d070ff", 2, LineStyle.LargeDashed, "MSS Level");
     }
-    if (data.amd?.manipulation_sl) {
+    if (chartLayers.amd && data.amd?.manipulation_sl) {
       addH(data.amd.manipulation_sl, C.red, 1, LineStyle.SparseDotted, "AMD SL", false);
     }
-    if (data.amd?.accumulation_range) {
+    if (chartLayers.amd && data.amd?.accumulation_range) {
       addH(data.amd.accumulation_range.high, C.green, 1, LineStyle.Dotted, "Acc H");
       addH(data.amd.accumulation_range.low,  C.green, 1, LineStyle.Dotted, "Acc L");
     }
-    if (data.amd?.entry_zone_low && data.amd?.entry_zone_high) {
+    if (chartLayers.amd && data.amd?.entry_zone_low && data.amd?.entry_zone_high) {
       addBand(chartInst.current, t0, t1,
         data.amd.entry_zone_high, data.amd.entry_zone_low, C.blue, LineStyle.SparseDotted, "AMD Entry", seriesRefs);
     }
 
     // 10. Nearest liquidity targets
-    addH(data.nearest_buy_side,  C.amber,  1, LineStyle.SparseDotted, "BuyLiq",  false);
-    addH(data.nearest_sell_side, C.purple, 1, LineStyle.SparseDotted, "SellLiq", false);
 
     // 11. Swing markers
     const markers = [];
-    (data.swing_highs || []).forEach((s) => {
-      const time = ohlc[s.index]?.time;
-      if (!time || !s.label) return;
-      markers.push({ time, position: "aboveBar", color: s.label === "HH" ? C.red : "#5c1428", shape: "arrowDown", text: s.label });
-    });
-    (data.swing_lows || []).forEach((s) => {
-      const time = ohlc[s.index]?.time;
-      if (!time || !s.label) return;
-      markers.push({ time, position: "belowBar", color: s.label === "LL" ? C.green : "#145c3c", shape: "arrowUp", text: s.label });
-    });
-    if (data.amd?.manipulation?.candle_index != null) {
+    if (chartLayers.structure) {
+      (data.swing_highs || []).slice(-4).forEach((s) => {
+        const time = ohlc[s.index]?.time;
+        if (!time || !s.label) return;
+        markers.push({ time, position: "aboveBar", color: s.label === "HH" ? C.red : "#5c1428", shape: "arrowDown", text: s.label });
+      });
+      (data.swing_lows || []).slice(-4).forEach((s) => {
+        const time = ohlc[s.index]?.time;
+        if (!time || !s.label) return;
+        markers.push({ time, position: "belowBar", color: s.label === "LL" ? C.green : "#145c3c", shape: "arrowUp", text: s.label });
+      });
+    }
+    if (chartLayers.amd && data.amd?.manipulation?.candle_index != null) {
       const mssTime = ohlc[data.amd.manipulation.candle_index]?.time;
       if (mssTime) {
         const isBearhunt = data.amd.manipulation.direction === "bearish_hunt";
@@ -1233,7 +1701,7 @@ export default function SMCDashboard() {
       }
     }
     // MSS level marker (confirmed structural shift candle)
-    if (data.amd?.mss_detected && data.amd?.mss_level) {
+    if (chartLayers.amd && data.amd?.mss_detected && data.amd?.mss_level) {
       // Find closest candle to MSS level (proxy: scan post-manip candles)
       const manipIdx = data.amd?.manipulation?.candle_index ?? 0;
       let bestIdx = -1, bestDiff = Infinity;
@@ -1258,20 +1726,18 @@ export default function SMCDashboard() {
       }
     }
     // Divergence pivot markers
-    if (data.amd?.divergence_detected && data.amd?.divergence_indices?.length >= 2) {
-      const [di1, di2] = data.amd.divergence_indices;
+    if (chartLayers.amd && data.amd?.divergence_detected && data.amd?.divergence_indices?.length >= 2) {
+      const [, di2] = data.amd.divergence_indices;
       const isBearhunt = data.amd.manipulation?.direction === "bearish_hunt";
-      [di1, di2].forEach((idx, n) => {
-        if (ohlc[idx]) {
-          markers.push({
-            time: ohlc[idx].time,
-            position: isBearhunt ? "aboveBar" : "belowBar",
-            color: C.red,
-            shape: isBearhunt ? "arrowDown" : "arrowUp",
-            text: n === 0 ? "DIV①" : "DIV②",
-          });
-        }
-      });
+      if (ohlc[di2]) {
+        markers.push({
+          time: ohlc[di2].time,
+          position: isBearhunt ? "aboveBar" : "belowBar",
+          color: C.red,
+          shape: isBearhunt ? "arrowDown" : "arrowUp",
+          text: "DIV",
+        });
+      }
     }
     if (markers.length) {
       markers.sort((a, b) => a.time - b.time);
@@ -1282,9 +1748,152 @@ export default function SMCDashboard() {
     chartInst.current.timeScale().fitContent();
     oscInst.current?.timeScale().fitContent();
     setTimeout(() => {
-      drawOverlay(canvasRef.current, chartInst.current, candleSer.current, data.amd, ohlc, sessRef.current);
+      drawOverlay(
+        canvasRef.current,
+        chartInst.current,
+        candleSer.current,
+        chartLayersRef.current.amd ? data.amd : null,
+        ohlc,
+        sessRef.current,
+      );
     }, 60);
-  }, [data]);
+  }, [data, chartLayers]);
+
+  useEffect(() => {
+    const chart = chartInst.current;
+    orderLinesRef.current.forEach(({ series }) => {
+      try { chart?.removeSeries(series); } catch {
+        // Chart refreshes can detach a series before this effect runs.
+      }
+    });
+    orderLinesRef.current = [];
+
+    const candles = ohlcRef.current;
+    if (!chart || candles.length < 2 || !data?.symbol) return undefined;
+
+    const matchingOrders = openOrders.filter(
+      p => p.status === "open" && p.mode === "paper"
+        && p.symbol === data.symbol && p.timeframe === data.timeframe,
+    );
+    const firstTime = candles[0].time;
+    const lastTime = candles[candles.length - 1].time;
+    matchingOrders.forEach(position => {
+      [["sl", position.sl, C.red], ["tp", position.tp, C.green]].forEach(([level, price, color]) => {
+        if (!Number.isFinite(Number(price)) || Number(price) <= 0) return;
+        const series = chart.addSeries(LineSeries, {
+          color,
+          lineWidth: 2,
+          lineStyle: LineStyle.Dashed,
+          crosshairMarkerVisible: false,
+          lastValueVisible: true,
+          priceLineVisible: false,
+          title: level.toUpperCase(),
+        });
+        series.setData([
+          { time: firstTime, value: Number(price) },
+          { time: lastTime, value: Number(price) },
+        ]);
+        orderLinesRef.current.push({
+          positionId: position.id,
+          position,
+          symbol: position.symbol,
+          timeframe: position.timeframe,
+          level,
+          price: Number(price),
+          series,
+          firstTime,
+          lastTime,
+          barTime: data.candles?.[data.candles.length - 1]?.time,
+        });
+      });
+    });
+
+    return () => {
+      orderLinesRef.current.forEach(({ series }) => {
+        try { chart.removeSeries(series); } catch {
+          // Ignore series already removed during a chart refresh.
+        }
+      });
+      orderLinesRef.current = [];
+    };
+  }, [openOrders, data?.symbol, data?.timeframe, data?.candles]);
+
+  useEffect(() => {
+    const container = chartRef.current;
+    if (!container) return undefined;
+
+    const positionFromEvent = (event) => {
+      const bounds = container.getBoundingClientRect();
+      return event.clientY - bounds.top;
+    };
+    const onPointerDown = (event) => {
+      if (event.button !== 0 || !candleSer.current || orderDragRef.current) return;
+      const y = positionFromEvent(event);
+      const line = orderLinesRef.current
+        .map(candidate => ({
+          candidate,
+          coordinate: candleSer.current.priceToCoordinate(candidate.price),
+        }))
+        .filter(({ coordinate }) => coordinate != null)
+        .map(item => ({ ...item, distance: Math.abs(item.coordinate - y) }))
+        .filter(item => item.distance <= 10)
+        .sort((a, b) => a.distance - b.distance)[0]?.candidate;
+      if (!line) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      orderDragRef.current = { line, pointerId: event.pointerId };
+      container.setPointerCapture(event.pointerId);
+      container.style.cursor = "ns-resize";
+    };
+    const onPointerMove = (event) => {
+      const drag = orderDragRef.current;
+      if (!drag) {
+        const y = positionFromEvent(event);
+        const overOrderLine = orderLinesRef.current.some(candidate => {
+          const coordinate = candleSer.current?.priceToCoordinate(candidate.price);
+          return coordinate != null && Math.abs(coordinate - y) <= 10;
+        });
+        container.style.cursor = overOrderLine ? "ns-resize" : "";
+        return;
+      }
+      if (event.pointerId !== drag.pointerId || !candleSer.current) return;
+
+      const price = candleSer.current.coordinateToPrice(positionFromEvent(event));
+      if (price == null || !Number.isFinite(price) || price <= 0) return;
+      const roundedPrice = Number(price.toFixed(priceDecimals(drag.line.symbol)));
+      drag.line.price = roundedPrice;
+      drag.line.series.setData([
+        { time: drag.line.firstTime, value: roundedPrice },
+        { time: drag.line.lastTime, value: roundedPrice },
+      ]);
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    const onPointerUp = (event) => {
+      const drag = orderDragRef.current;
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      orderDragRef.current = null;
+      container.style.cursor = "";
+      if (container.hasPointerCapture(event.pointerId)) {
+        container.releasePointerCapture(event.pointerId);
+      }
+      stageOrderLevel(drag.line.position, drag.line.level, drag.line.price);
+    };
+
+    container.addEventListener("pointerdown", onPointerDown, true);
+    container.addEventListener("pointermove", onPointerMove, true);
+    container.addEventListener("pointerup", onPointerUp, true);
+    container.addEventListener("pointercancel", onPointerUp, true);
+    return () => {
+      container.removeEventListener("pointerdown", onPointerDown, true);
+      container.removeEventListener("pointermove", onPointerMove, true);
+      container.removeEventListener("pointerup", onPointerUp, true);
+      container.removeEventListener("pointercancel", onPointerUp, true);
+      container.style.cursor = "";
+      orderDragRef.current = null;
+    };
+  }, [stageOrderLevel, openOrders, data?.symbol, data?.timeframe, data?.candles]);
 
   // ── Higher-timeframe high / low lines ───────────────────────────────────────
   useEffect(() => {
@@ -1307,15 +1916,15 @@ export default function SMCDashboard() {
     const addLevel = (bar, tf, current) => {
       let i = ohlc.findIndex(c => c.time >= bar.time);
       if (i < 0 || i > n - 2) i = n - 2;          // period starts past the chart's last bar
-      [["H", bar.high], ["L", bar.low]].forEach(([hl, value]) => {
+      [["H", bar.high], ["L", bar.low]].forEach(([, value]) => {
         const s = chart.addSeries(LineSeries, {
           color: LEVEL_COLORS[tf],
           lineWidth: current ? 1 : 2,
           lineStyle: current ? LineStyle.Dotted : LineStyle.Dashed,
           crosshairMarkerVisible: false,
-          lastValueVisible: true,
+          lastValueVisible: false,
           priceLineVisible: false,
-          title: levelLabel(tf, hl, current),
+          title: "",
           autoscaleInfoProvider: () => null,      // far-away weekly levels must not squash the chart
         });
         s.setData([{ time: ohlc[i].time, value }, { time: tEnd, value }]);
@@ -1337,6 +1946,8 @@ export default function SMCDashboard() {
   // ── Derived ─────────────────────────────────────────────────────────────────
   const trendColor  = !data ? "gray" : data.trend === "BULLISH" ? "green" : data.trend === "BEARISH" ? "red" : "gray";
   const signalColor = !data ? "gray" : data.signal === "BUY" ? "green" : data.signal === "SELL" ? "red" : "amber";
+  const manualBuyAvailable = !!manualTradeLevels("BUY", data);
+  const manualSellAvailable = !!manualTradeLevels("SELL", data);
   const amdPhaseColor = !data?.amd ? "gray" : data.amd.phase === "ACCUMULATION" ? "green" : data.amd.phase === "MANIPULATION" ? "amber" : data.amd.phase === "DISTRIBUTION" ? "blue" : "gray";
   const confColor   = !data ? C.muted : data.confidence > 0.65 ? C.green : data.confidence > 0.45 ? C.amber : C.red;
   const entryMid    = data?.entry_zone?.length === 2 ? ((data.entry_zone[0] + data.entry_zone[1]) / 2).toFixed(5) : null;
@@ -1361,12 +1972,33 @@ export default function SMCDashboard() {
     w => w.toLowerCase().includes("premium zone") || w.toLowerCase().includes("discount zone") || w.toLowerCase().includes("hard suppression")
   );
 
+  const scrollToSection = (id) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+
   // ── Render ──────────────────────────────────────────────────────────────────
   return (
-    <div style={{ background: C.bg, minHeight: "100vh", color: C.text, padding: "18px 22px", fontFamily: "system-ui, sans-serif" }}>
+    <div className="dashboard-shell">
+      <aside className="dashboard-sidebar">
+        <div className="sidebar-brand"><span className="sidebar-brand-mark">S</span><span>SMC<br />ENGINE</span></div>
+        <div className="sidebar-label">WORKSPACE</div>
+        <button className="sidebar-link active" onClick={() => scrollToSection("dashboard-workspace")}>
+          <span>▦</span> Dashboard
+        </button>
+        <button className="sidebar-link" onClick={() => scrollToSection("market-bot-panel")}>
+          <span>◉</span> Market Bot
+        </button>
+        <button className="sidebar-link" onClick={() => scrollToSection("analysis-details")}>
+          <span>⌁</span> Analysis
+        </button>
+        <div className="sidebar-note">
+          <span className="status-dot" />
+          Paper trading
+          <small>Orders are simulated</small>
+        </div>
+      </aside>
+      <main className="dashboard-main">
 
       {/* ── Header ── */}
-      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 16 }}>
+      <div className="dashboard-topbar" style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 16 }}>
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <h1 style={{ margin: 0, fontSize: 20, fontWeight: 800, letterSpacing: -0.5 }}>SMC Engine</h1>
@@ -1389,11 +2021,8 @@ export default function SMCDashboard() {
         </div>
       </div>
 
-      {/* ── Bot ── */}
-      <BotPanel />
-
       {/* ── Controls ── */}
-      <div style={{
+      <div className="dashboard-controls" style={{
         display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center",
         background: C.surface, borderRadius: 10, padding: "10px 14px",
         border: `1px solid ${C.border}`, marginBottom: 14,
@@ -1502,6 +2131,28 @@ export default function SMCDashboard() {
           Auto 30s
         </label>
 
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginLeft: 4 }}>
+          <span style={{ fontSize: 10, color: C.muted2, fontWeight: 700 }}>MANUAL PAPER</span>
+          <button
+            onClick={() => placeManualPaperTrade("BUY")}
+            disabled={manualBusy || !manualBuyAvailable}
+            style={{
+              ...btnSt, color: C.green, background: C.greenDim,
+              border: `1px solid ${C.green}55`,
+              opacity: manualBusy || !manualBuyAvailable ? 0.45 : 1,
+            }}
+          >{manualBusy ? "…" : "Buy"}</button>
+          <button
+            onClick={() => placeManualPaperTrade("SELL")}
+            disabled={manualBusy || !manualSellAvailable}
+            style={{
+              ...btnSt, color: C.red, background: C.redDim,
+              border: `1px solid ${C.red}55`,
+              opacity: manualBusy || !manualSellAvailable ? 0.45 : 1,
+            }}
+          >{manualBusy ? "…" : "Sell"}</button>
+        </div>
+
         <button onClick={fetchData} disabled={loading} style={{
           ...btnSt, marginLeft: "auto",
           background: loading ? C.surface2 : C.blue, color: "#fff",
@@ -1511,6 +2162,21 @@ export default function SMCDashboard() {
           {loading ? "Analyzing…" : "⟳ Analyze"}
         </button>
       </div>
+      {manualMessage && (
+        <div style={{
+          margin: "-5px 0 12px", fontSize: 11, lineHeight: 1.4,
+          color: manualMessage.type === "success" ? C.green : C.red,
+        }}>{manualMessage.text}</div>
+      )}
+
+      {/* ── Bot ── */}
+      <BotPanel
+        onClosePosition={closeOrder}
+        onUpdatePosition={updateOrder}
+        onShowPosition={showPositionOnChart}
+        orderDrafts={orderDrafts}
+        setOrderDrafts={setOrderDrafts}
+      />
 
       {err && (
         <div style={{
@@ -1521,15 +2187,17 @@ export default function SMCDashboard() {
         </div>
       )}
 
+      <section className="workspace-grid" id="dashboard-workspace">
+        <div className="workspace-chart">
       {/* ── Chart ── */}
-      <div style={{ background: C.bg, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden", marginBottom: 14, position: "relative" }}>
+      <div id="trade-chart" className="chart-panel" style={{ background: C.bg, borderRadius: 12, border: `1px solid ${C.border}`, overflow: "hidden", marginBottom: 14, position: "relative" }}>
         {data && (
           <div style={{
             display: "flex", gap: 12, padding: "9px 14px",
             borderBottom: `1px solid ${C.border}`, flexWrap: "wrap", alignItems: "center",
           }}>
             <span style={{ fontSize: 15, fontWeight: 800, fontFamily: "monospace" }}>{data.symbol}</span>
-            <span style={{ fontSize: 15, fontWeight: 700, fontFamily: "monospace", color: C.blue }}>{fmt(data.current_price)}</span>
+            <span style={{ fontSize: 15, fontWeight: 700, fontFamily: "monospace", color: C.blue }}>{fmtPrice(data.current_price, data.symbol)}</span>
             <Badge label={data.trend} color={trendColor} />
             {data.last_event && <Badge label={data.last_event} color="blue" />}
             <Badge label={data.signal} color={signalColor} />
@@ -1557,45 +2225,114 @@ export default function SMCDashboard() {
                 small
               />
             )}
+            <div ref={chartLayersBox} style={{ position: "relative", marginLeft: "auto" }}>
+              <button
+                onClick={() => setChartLayersOpen((open) => !open)}
+                aria-expanded={chartLayersOpen}
+                style={{
+                  ...btnSt,
+                  color: C.muted2,
+                  border: `1px solid ${C.border}`,
+                  background: chartLayersOpen ? C.surface2 : "transparent",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Layers ({Object.values(chartLayers).filter(Boolean).length}) ▾
+              </button>
+              {chartLayersOpen && (
+                <div style={{
+                  position: "absolute", top: "calc(100% + 6px)", right: 0, zIndex: 50, width: 190,
+                  background: C.surface2, border: `1px solid ${C.border2}`, borderRadius: 10,
+                  padding: 12, boxShadow: "0 10px 28px rgba(0,0,0,0.5)",
+                }}>
+                  <div style={ddLabelSt}>Chart layers</div>
+                  {[
+                    ["tradePlan", "Trade plan"],
+                    ["amd", "AMD zones & signals"],
+                    ["structure", "Structure & swings"],
+                    ["liquidity", "Liquidity levels"],
+                  ].map(([key, label]) => (
+                    <label key={key} style={{ ...chkSt, display: "flex", margin: "8px 0" }}>
+                      <input
+                        type="checkbox"
+                        checked={chartLayers[key]}
+                        onChange={(e) => setChartLayers((current) => ({
+                          ...current,
+                          [key]: e.target.checked,
+                        }))}
+                        style={{ accentColor: C.blue }}
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
-        {/* Legend */}
+        {/* Keep the legend limited to layers that are currently visible. */}
         <div style={{
-          display: "flex", gap: 12, padding: "5px 14px",
-          borderBottom: `1px solid ${C.border}`, flexWrap: "wrap",
+          display: "flex", gap: 14, padding: "6px 14px",
+          borderBottom: `1px solid ${C.border}`, flexWrap: "wrap", alignItems: "center",
         }}>
-          {[
-            { c: "rgba(245,166,35,0.5)", l: "Accumulation" },
-            { c: "rgba(240,71,106,0.5)", l: "Manipulation" },
-            { c: "rgba(32,214,138,0.5)", l: "Distribution" },
-            { c: "#d070ff", l: "MSS" },
-            { c: C.amber, l: "Buyside Liq" },
-            { c: C.purple, l: "Sellside Liq" },
-            { c: C.amber,   l: "EQH/EQL" }, { c: C.fvgBull, l: "FVG▲" }, { c: C.fvgBear, l: "FVG▼" },
-            { c: C.obBull,  l: "OB▲" },     { c: C.obBear,  l: "OB▼" },  { c: C.ote,     l: "OTE" },
-            { c: C.orange,  l: "Premium" },  { c: C.blue,    l: "Discount" }, { c: C.muted, l: "EQ" },
-            { c: C.blue,    l: "Entry" },    { c: C.green,   l: "TP" },    { c: C.red,     l: "SL" },
-            { c: C.amber,  l: "Manip Extreme" },
-            { c: "#d070ff", l: "MSS Level" },
-          ].filter(({ l }) => !l.includes("FVG") && !l.includes("OB") && !["OTE", "Premium", "Discount"].includes(l)).map(({ c, l }) => (
-            <span key={l} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10, color: C.muted }}>
-              <span style={{ width: 10, height: 2, background: c, display: "inline-block", borderRadius: 1 }} />
-              {l}
+          <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: C.muted2 }}>
+            <span style={{ color: C.green }}>▲</span>/<span style={{ color: C.red }}>▼</span> Price
+          </span>
+          {chartLayers.tradePlan && (
+            <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: C.muted2 }}>
+              <span style={{ color: C.blue }}>—</span> Entry
+              <span style={{ color: C.green }}>—</span> TP
+              <span style={{ color: C.red }}>—</span> SL
             </span>
-          ))}
+          )}
+          {chartLayers.amd && (
+            <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: C.muted2 }}>
+              <span style={{ color: C.amber }}>—</span> AMD
+              <span style={{ color: C.purple }}>—</span> MSS
+            </span>
+          )}
+          {chartLayers.structure && (
+            <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: C.muted2 }}>
+              <span style={{ color: C.blue }}>- -</span> Structure
+            </span>
+          )}
+          {chartLayers.liquidity && (
+            <span style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 10, color: C.muted2 }}>
+              <span style={{ color: C.amber }}>···</span> Liquidity
+            </span>
+          )}
         </div>
-        <div ref={chartRef} style={{ width: "100%", height: 520 }} />
+        {orderActionMessage && (
+          <div className={`order-chart-message ${orderActionMessage.type}`}>
+            {orderActionMessage.text}
+          </div>
+        )}
+        {data && openOrders.some(position => (
+          position.symbol === data.symbol && position.timeframe === data.timeframe
+        )) && (
+          <div className="order-chart-hint">
+            Drag an SL or TP line to stage a change, then click Update in Order Status.
+          </div>
+        )}
+        {data && openOrders.length > 0 && !openOrders.some(position => (
+          position.symbol === data.symbol && position.timeframe === data.timeframe
+        )) && (
+          <div className="order-chart-hint">
+            Choose Chart on an open order to load its symbol and timeframe here.
+          </div>
+        )}
+        <div ref={chartRef} style={{ width: "100%", height: 390 }} />
         <canvas
           ref={canvasRef}
           width={800}
-          height={520}
+          height={390}
           style={{
             position: "absolute",
             bottom: 120,
             left: 0,
             width: "100%",
-            height: 520,
+            height: 390,
             pointerEvents: "none",
             zIndex: 10,
           }}
@@ -1619,17 +2356,114 @@ export default function SMCDashboard() {
           <div ref={oscRef} style={{ width: "100%", height: 120 }} />
         </div>
       </div>
+        </div>
+
+        {data ? (
+          <>
+            <div className="workspace-center">
+              <section className="overview-card execution-overview">
+                <div className="overview-card-heading">
+                  <span>Execution panel</span>
+                  <Badge
+                    label={data.ready_to_trade ? "READY" : data.signal === "WAIT" ? "WAIT" : "BLOCKED"}
+                    color={data.ready_to_trade ? "green" : data.signal === "WAIT" ? "amber" : "red"}
+                    small
+                  />
+                </div>
+                <div className="execution-summary">
+                  <div className="quick-action">
+                    <span className="eyebrow">Signal</span>
+                    <SignalGlyph signal={data.signal} />
+                    <span className="quick-score">{data.confluence_score}<small>/100</small></span>
+                    <Bar value={data.confidence * 100} color={confColor} />
+                    <span className="quick-confidence">{fmtPct(data.confidence * 100)} confidence</span>
+                  </div>
+                  <div className="execution-levels">
+                    <Stat label="Entry" value={fmtPrice(data.exec_entry || data.current_price, data.symbol)} color={C.blue} />
+                    <Stat label="Stop loss" value={fmtPrice(data.exec_sl || data.stop_loss, data.symbol)} color={C.red} />
+                    <Stat label="Take profit" value={fmtPrice(data.exec_tp || data.take_profit, data.symbol)} color={C.green} />
+                    <Stat label="Risk / reward" value={data.rr_ratio > 0 ? `1 : ${data.rr_ratio}` : "—"} color={C.amber} />
+                  </div>
+                </div>
+                <div className="execution-footer">
+                  <span>{data.sizing?.allowed ? `${data.sizing.lots?.toFixed(2)} lots` : "Sizing unavailable"}</span>
+                  <span>{data.sizing?.allowed ? `Risk $${data.sizing.risk_amount?.toFixed(2)}` : data.sizing?.reason}</span>
+                </div>
+                {!!data.block_reasons?.length && (
+                  <div className="overview-alert">{data.block_reasons[0]}</div>
+                )}
+              </section>
+
+              <section className="overview-card ote-overview">
+                <div className="overview-card-heading"><span>Optimal trade entry</span><span className="eyebrow">OTE ZONE</span></div>
+                <div className="ote-range">
+                  <div><span>Low</span><strong>{fmtPrice(data.ote_low, data.symbol)}</strong></div>
+                  <i />
+                  <div><span>High</span><strong>{fmtPrice(data.ote_high, data.symbol)}</strong></div>
+                </div>
+                <Badge label={data.inside_ote ? "Price inside OTE" : "Price outside OTE"} color={data.inside_ote ? "green" : "gray"} small />
+              </section>
+
+              <section className="overview-card amd-overview">
+                <div className="overview-card-heading">
+                  <span>AMD setup / execution log</span>
+                  {data.amd?.phase && <Badge label={data.amd.phase} color={amdPhaseColor} small />}
+                </div>
+                <div className="overview-log">
+                  {data.amd?.accumulation_range && <div><span>•</span> Accumulation range: {fmtPrice(data.amd.accumulation_range.low, data.symbol)} – {fmtPrice(data.amd.accumulation_range.high, data.symbol)}</div>}
+                  {data.amd?.manipulation && <div><span>•</span> Manipulation: {data.amd.manipulation.direction?.replace(/_/g, " ")} · {fmtPrice(data.amd.manipulation.extreme, data.symbol)}</div>}
+                  {data.amd?.notes?.[0] && <div><span>•</span> {data.amd.notes[0]}</div>}
+                  {!data.amd?.accumulation_range && !data.amd?.manipulation && <div>No completed AMD setup detected.</div>}
+                </div>
+              </section>
+            </div>
+
+            <aside className="workspace-right">
+              <section className="overview-card risk-overview">
+                <div className="overview-card-heading">
+                  <span>Risk manager</span>
+                  {riskData?.halted && <Badge label="HALTED" color="red" small />}
+                </div>
+                <div className="risk-metrics">
+                  <Stat label="Trades today" value={riskData?.trades_today ?? "—"} color={C.text} />
+                  <Stat label="Open trades" value={riskData?.open_trades ?? "—"} color={C.text} />
+                  <Stat label="Daily P&L" value={riskData ? `${riskData.daily_pnl >= 0 ? "+" : ""}${fmtPct(riskData.daily_pnl_pct)}` : "—"} color={!riskData ? C.muted2 : riskData.daily_pnl >= 0 ? C.green : C.red} />
+                  <Stat label="Loss budget left" value={riskData ? fmtPct((riskData.daily_loss_remaining_pct || 0) * 100) : "—"} color={C.amber} />
+                </div>
+                <div className="risk-budget-track"><span style={{ width: `${Math.min(100, Math.max(0, (riskData?.daily_loss_remaining_pct || 0) / 0.02 * 100))}%` }} /></div>
+                {riskData?.halted && <div className="overview-alert">{riskData.halt_reason}</div>}
+              </section>
+
+              <section className="overview-card market-overview">
+                <div className="overview-card-heading"><span>Market context</span><span className="eyebrow">{data.timeframe}</span></div>
+                <div className="context-list">
+                  <div><span>Trend</span><strong>{data.trend}</strong></div>
+                  <div><span>Market structure</span><strong>{data.last_event || "—"}</strong></div>
+                  <div><span>Session</span><strong>{data.scalp_filter?.session || "—"}</strong></div>
+                  <div><span>Spread</span><strong>{data.scalp_filter?.spread_pips == null ? "—" : `${data.scalp_filter.spread_pips.toFixed(1)} pips`}</strong></div>
+                  <div><span>FVGs / stop hunts</span><strong>{data.fvgs?.length || 0} / {data.stop_hunts?.length || 0}</strong></div>
+                </div>
+                {data.warnings?.[0] && <div className="overview-warning">{data.warnings[0]}</div>}
+              </section>
+            </aside>
+          </>
+        ) : (
+          <div className="workspace-empty">
+            {loading ? "Loading market analysis…" : "Market analysis will appear here when the API is connected."}
+          </div>
+        )}
+      </section>
 
       {data && (
         <>
           {data.amd && (
-            <div style={{ display: "grid", gridTemplateColumns: "minmax(320px, 1.15fr) minmax(280px, 0.85fr)", gap: 12, marginBottom: 12 }}>
+            <div className="detail-grid detail-grid-amd" style={{ display: "grid", gridTemplateColumns: "minmax(320px, 1.15fr) minmax(280px, 0.85fr)", gap: 12, marginBottom: 12 }}>
               <AMDPhaseCard amd={data.amd} symbol={data.symbol || symbol} />
               <AMDSetupCard data={data} />
             </div>
           )}
           {/* ── Row 1: Signal · Entry · R/R · Structure ── */}
-          <div style={{ display: "grid", gridTemplateColumns: "200px 1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
+          <div className="detail-grid detail-grid-primary" style={{ display: "grid", gridTemplateColumns: "200px 1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
 
             {/* Signal */}
             <div style={cardSt}>
@@ -1727,7 +2561,7 @@ export default function SMCDashboard() {
           </div>
 
           {/* ── Row 2: Liquidity · OTE · Displacement ── */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
+          <div className="detail-grid detail-grid-three" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
             <div style={cardSt}>
               <SecTitle>Liquidity Targets</SecTitle>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -1778,7 +2612,7 @@ export default function SMCDashboard() {
           </div>
 
           {/* ── NEW Row 3: Execution Layer (Scalp) ── */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
+          <div className="detail-grid detail-grid-three" style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12, marginBottom: 12 }}>
 
             {/* Scalp verdict */}
             <div style={{
@@ -1877,8 +2711,8 @@ export default function SMCDashboard() {
           )}
 
           {/* ── Analysis Tabs ── */}
-          <div style={{ ...cardSt, marginBottom: 12 }}>
-            <div style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: `1px solid ${C.border}`, paddingBottom: 0 }}>
+          <div id="analysis-details" style={{ ...cardSt, marginBottom: 12 }}>
+            <div className="analysis-tabs" style={{ display: "flex", gap: 4, marginBottom: 14, borderBottom: `1px solid ${C.border}`, paddingBottom: 0 }}>
               {[
                 { id: "confluence", label: `Confluence (${data.reasons?.length || 0})` },
                 { id: "execution",  label: `Exec Filter (${(data.scalp_filter?.passed_checks?.length || 0) + (data.scalp_filter?.failed_checks?.length || 0)})` },
@@ -2069,6 +2903,7 @@ export default function SMCDashboard() {
       <p style={{ marginTop: 14, fontSize: 10, color: C.muted, textAlign: "center" }}>
         SMC Engine v4.0 · Not financial advice · Always manage risk · {data?.symbol} {data?.timeframe}
       </p>
+      </main>
     </div>
   );
 }

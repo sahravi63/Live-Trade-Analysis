@@ -64,12 +64,18 @@ python -m unittest discover -s tests -v   # offline test suite
   - `paper` (default): simulated fills, no orders sent anywhere
   - `alerts-only`: just tells you about setups
   - `mt5-demo`: sends market orders with SL/TP to MT5 — **refuses to run unless the logged-in account is a demo account**
+- The dashboard's top **Buy** and **Sell** controls open manual paper trades. Both directions are available regardless of the signal; the matching signal uses its analysis levels, while the opposite direction (or WAIT) gets ATR-based levels. Manual trades bypass automatic setup filters but still obey risk sizing, cooldown, max-open, and minimum R:R checks; they never send broker orders.
+- The dashboard's **Demo account** panel shows balance, mark-to-market equity, floating P&L, open orders, and recent closures. Deposit and withdrawal controls modify only the persisted virtual paper account; withdrawals cannot exceed realized balance.
+- Open paper orders can be closed from the order table. The matching chart shows only concise `SL` and `TP` labels; use the order controls to step those prices up/down and edit lots, then click **Update** to apply the changes. Stop losses can only move toward lower risk, and increased lots must stay within the per-trade risk limit.
+- The API monitors open paper orders every 15 seconds even when **Market Bot** is stopped. A new candle that hits SL or TP closes at that level; if one candle touches both, SL is assumed first. Keep the API process running for automatic monitoring.
 - Telegram: add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to `.env`
 
 ### API endpoints added
 
-`GET /bot/status` · `POST /bot/start` · `POST /bot/stop` · `POST /bot/scan-once` ·
-`GET /bot/journal` · `POST /bot/reset-paper` · `GET /bot/backtest?symbol=EURUSD&timeframe=M5`
+`GET /bot/status` · `POST /bot/start` · `POST /bot/stop` · `POST /bot/scan-once` · `POST /bot/manual-trade` ·
+`POST /bot/positions/{position_id}/close` · `PATCH /bot/positions/{position_id}` ·
+`POST /bot/paper-account/deposit` · `POST /bot/paper-account/withdraw` · `GET /bot/journal` ·
+`POST /bot/reset-paper` · `GET /bot/backtest?symbol=EURUSD&timeframe=M5`
 
 ### Fixes made while building the bot
 

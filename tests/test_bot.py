@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone, timedelta
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -41,6 +42,27 @@ class TestData(unittest.TestCase):
     def test_yahoo_tickers(self):
         self.assertEqual(dc.yahoo_ticker("EURUSD"), "EURUSD=X")
         self.assertEqual(dc.yahoo_ticker("XAUUSD"), "GC=F")
+        for symbol, ticker in {
+            "BTCUSD": "BTC-USD",
+            "USOIL": "CL=F",
+            "USTECH": "^NDX",
+            "ETHUSD": "ETH-USD",
+            "XAGUSD": "SI=F",
+            "US30": "^DJI",
+            "SPX500": "^GSPC",
+            "UK100": "^FTSE",
+        }.items():
+            with self.subTest(symbol=symbol):
+                self.assertEqual(dc.yahoo_ticker(symbol), ticker)
+
+    def test_non_fx_pip_sizes(self):
+        for symbol, expected in {
+            "USOIL": 0.01,
+            "USTECH": 1.0,
+            "BTCUSD": 1.0,
+        }.items():
+            with self.subTest(symbol=symbol):
+                self.assertEqual(dc.pip_size(symbol), expected)
 
     def test_mock_needs_no_credentials(self):
         self.assertEqual(len(dc.fetch_candles("EURUSD", "M5", 120, use_mock=True)), 120)
@@ -87,6 +109,181 @@ class TestPaper(unittest.TestCase):
                                                   self.bar(10, 1.1005, 1.0995, 1.0995)])
         self.assertTrue(closed[0].exit_reason.startswith("time exit"))
         self.assertGreater(closed[0].pnl, 0)
+
+    def test_equity_tracks_open_position_mark(self):
+        p = self.b.open("EURUSD", "M5", "BUY", 1.1, 1.099, 1.102, 0.5, 50, self.t0)
+        self.b.update("EURUSD", "M5", [self.bar(5, 1.1015, 1.1005, 1.101)])
+        self.assertEqual(p.mark_price, 1.101)
+        self.assertEqual(p.unrealized_pnl, 50.0)
+        self.assertEqual(self.b.balance(), 10_000)
+        self.assertEqual(self.b.equity(), 10_050)
+
+    def test_deposit_withdrawal_and_account_persist(self):
+        self.b.deposit(500)
+        self.b.withdraw(150)
+        self.assertEqual(self.b.balance(), 10_350)
+        with self.assertRaises(ValueError):
+            self.b.withdraw(10_350.01)
+
+        restored = PaperBroker(self.b.path)
+        self.assertEqual(restored.balance(), 10_350)
+        self.assertEqual([event["type"] for event in restored.funding_events],
+                         ["deposit", "withdrawal"])
+
+    def test_trailing_level_only_applies_after_update_bar(self):
+        p = self.b.open("EURUSD", "M5", "BUY", 1.1, 1.099, 1.102, 0.5, 50, self.t0)
+        self.b.update("EURUSD", "M5", [self.bar(5, 1.1015, 1.1009, 1.101)])
+        self.b.update_position(
+            p, 1.1008, p.tp, p.lots, self.bar(5, 1.1015, 1.1009)["time"],
+            max_risk_amount=50,
+        )
+        self.assertEqual(p.sl, 1.1008)
+        self.assertEqual(self.b.update("EURUSD", "M5", [
+            self.bar(5, 1.1015, 1.1009, 1.101),
+        ]), [])
+
+        closed = self.b.update("EURUSD", "M5", [
+            self.bar(5, 1.1015, 1.1009, 1.101),
+            self.bar(10, 1.1015, 1.1007, 1.101),
+        ])
+        self.assertEqual(closed[0].exit_reason, "stop loss")
+        self.assertEqual(closed[0].exit_price, 1.1008)
+
+    def test_sell_stop_can_trail_down_without_widening_risk(self):
+        p = self.b.open("EURUSD", "M5", "SELL", 1.1, 1.101, 1.098, 0.45, 50, self.t0)
+        self.b.update("EURUSD", "M5", [self.bar(5, 1.0995, 1.0985, 1.099)])
+        updated = self.b.update_position(
+            p, 1.0998, p.tp, p.lots, self.bar(5, 1.0995, 1.0985, 1.099)["time"],
+            max_risk_amount=50,
+        )
+        self.assertEqual(updated.sl, 1.0998)
+        with self.assertRaisesRegex(ValueError, "cannot widen risk"):
+            self.b.update_position(
+                p, 1.1002, p.tp, p.lots, self.bar(5, 1.0995, 1.0985, 1.099)["time"],
+                max_risk_amount=50,
+            )
+
+    def test_updated_take_profit_auto_closes_and_lot_update_obeys_risk(self):
+        p = self.b.open("EURUSD", "M5", "BUY", 1.1, 1.099, 1.103, 0.45, 50, self.t0)
+        self.b.update("EURUSD", "M5", [self.bar(5, 1.1014, 1.1006, 1.101)])
+        updated = self.b.update_position(
+            p, 1.1005, 1.1015, 0.4, self.bar(5, 1.1014, 1.1006)["time"],
+            max_risk_amount=50,
+        )
+        self.assertEqual(updated.lots, 0.4)
+        with self.assertRaisesRegex(ValueError, "above the"):
+            self.b.update_position(
+                p, 1.1005, 1.1015, 2.0, self.bar(5, 1.1014, 1.1006)["time"],
+                max_risk_amount=50,
+            )
+        closed = self.b.update("EURUSD", "M5", [
+            self.bar(5, 1.1014, 1.1006, 1.101),
+            self.bar(10, 1.1017, 1.101, 1.1016),
+        ])
+        self.assertEqual(closed[0].exit_reason, "take profit")
+        self.assertEqual(closed[0].exit_price, 1.1015)
+        self.assertEqual(closed[0].lots, 0.4)
+
+
+class TestManualPaperTrade(unittest.TestCase):
+    def test_dead_bot_lock_is_not_reported_as_running(self):
+        tmp = tempfile.mkdtemp()
+        cfg = copy.deepcopy(botmod.DEFAULT_CONFIG)
+        b = botmod.MarketBot(
+            cfg, out_dir=os.path.join(tmp, "out"), state_dir=os.path.join(tmp, "st"),
+        )
+        with open(b.lock_path, "w", encoding="utf-8") as lock_file:
+            json.dump({"pid": 2**30, "heartbeat": datetime.now(timezone.utc).timestamp()}, lock_file)
+
+        self.assertFalse(b.external_running())
+        b._acquire_lock()
+        b._release_lock()
+
+    def test_opens_with_risk_checks_and_blocks_duplicate_symbol(self):
+        tmp = tempfile.mkdtemp()
+        cfg = copy.deepcopy(botmod.DEFAULT_CONFIG)
+        cfg["alerts"].update({"sound": False, "telegram": False})
+        cfg["account"]["cooldown_seconds"] = 0
+        b = botmod.MarketBot(
+            cfg, out_dir=os.path.join(tmp, "out"), state_dir=os.path.join(tmp, "st"),
+        )
+        bar_time = "2026-10-24T10:00:00+00:00"
+
+        p = b.open_manual_paper_trade(
+            "EURUSD", "M5", "BUY", 1.1, 1.099, 1.102, bar_time, confidence=0.7,
+        )
+        self.assertEqual(p.mode, "paper")
+        self.assertEqual(p.direction, "BUY")
+        self.assertLess(p.sl, p.entry)
+        self.assertGreater(p.tp, p.entry)
+        self.assertIn(p.id, b.orch.risk_mgr.state.open_trades)
+        with self.assertRaises(RuntimeError):
+            b.open_manual_paper_trade(
+                "EURUSD", "M5", "SELL", 1.1, 1.101, 1.098, bar_time,
+            )
+
+    def test_rejects_invalid_levels_and_insufficient_reward(self):
+        tmp = tempfile.mkdtemp()
+        cfg = copy.deepcopy(botmod.DEFAULT_CONFIG)
+        cfg["alerts"].update({"sound": False, "telegram": False})
+        cfg["account"]["cooldown_seconds"] = 0
+        b = botmod.MarketBot(
+            cfg, out_dir=os.path.join(tmp, "out"), state_dir=os.path.join(tmp, "st"),
+        )
+        bar_time = "2026-10-24T10:00:00+00:00"
+        with self.assertRaises(ValueError):
+            b.open_manual_paper_trade(
+                "EURUSD", "M5", "BUY", 1.1, 1.101, 1.102, bar_time,
+            )
+        with self.assertRaises(ValueError):
+            b.open_manual_paper_trade(
+                "EURUSD", "M5", "BUY", 1.1, 1.099, 1.1005, bar_time,
+            )
+
+    def test_manual_close_updates_paper_balance_and_risk_state(self):
+        tmp = tempfile.mkdtemp()
+        cfg = copy.deepcopy(botmod.DEFAULT_CONFIG)
+        cfg["alerts"].update({"sound": False, "telegram": False})
+        cfg["account"]["cooldown_seconds"] = 0
+        b = botmod.MarketBot(
+            cfg, out_dir=os.path.join(tmp, "out"), state_dir=os.path.join(tmp, "st"),
+        )
+        position = b.open_manual_paper_trade(
+            "EURUSD", "M5", "BUY", 1.1, 1.099, 1.102,
+            "2026-10-24T10:00:00+00:00",
+        )
+        position.mark_price = 1.101
+        closed = b.close_paper_position(position.id)
+
+        self.assertEqual(closed.status, "closed")
+        self.assertEqual(closed.exit_reason, "manual close")
+        self.assertAlmostEqual(closed.pnl, 45.0)
+        self.assertEqual(b.broker.balance(), 10_045.0)
+        self.assertNotIn(position.id, b.orch.risk_mgr.state.open_trades)
+
+    def test_unconfigured_manual_timeframe_still_auto_closes(self):
+        tmp = tempfile.mkdtemp()
+        cfg = copy.deepcopy(botmod.DEFAULT_CONFIG)
+        cfg["alerts"].update({"sound": False, "telegram": False})
+        cfg["account"]["cooldown_seconds"] = 0
+        b = botmod.MarketBot(
+            cfg, out_dir=os.path.join(tmp, "out"), state_dir=os.path.join(tmp, "st"),
+        )
+        position = b.open_manual_paper_trade(
+            "EURUSD", "M30", "BUY", 1.1, 1.099, 1.102,
+            "2026-10-24T10:00:00+00:00",
+        )
+        candles = [{
+            "time": "2026-10-24T10:30:00+00:00",
+            "open": 1.1, "high": 1.1025, "low": 1.1005, "close": 1.102,
+            "volume": 0,
+        }]
+        with patch.object(botmod.dc, "fetch_candles", return_value=candles):
+            errors = b._manage_unconfigured_positions()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(position.status, "closed")
+        self.assertEqual(position.exit_reason, "take profit")
 
 
 class TestEngine(unittest.TestCase):
